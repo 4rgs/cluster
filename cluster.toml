@@ -1,72 +1,132 @@
 # Cluster de desarrollo — config de nodos
-# Master: este ClockworkPi (192.168.1.226) — Hermes Agent minimax-m3
-# Routing: keyword scoring. Slave-A=chat, Slave-B=código. No filesystem access.
+# Schema: [meta] + [routing] + [feedback] + lista de [[node]]
+# Cada nodo tiene: name, role, host, port, base_url, protocol, model, timeout_s, enabled
+# Agregar nodos via: clusterctl nodes add <name> --host ... --protocol ... --model ...
 
 [meta]
 name = "spids-dev-cluster"
 created = "2026-06-12"
 constraint = "modelos livianos — no saturar hardware"
 
-[slave-a]
-role = "chat_reflection"
-host = "192.168.1.123"
-protocol = "ollama"
-base_url = "http://192.168.1.123:11434"
-model = "gemma4:12b-mlx"
-fallback_model = "llama3:latest"
-purpose = "razonamiento general, reflexión, resúmenes, explicaciones"
-timeout_s = 120
-
-[slave-b]
-role = "code_tools"
-host = "192.168.1.134"
-protocol = "lmstudio"
-base_url = "http://192.168.1.134:1234/v1"
-model = "qwen/qwen3.6-27b"   # MoE ~3B activos, 27B totales — encaja en 32GB VRAM
-fallback_model = "qwen/qwen3.6-27b"
-purpose = "código, comandos bash, iteración multi-step, tool calling"
-timeout_s = 180
-
-# Modelos descartados explícitamente (usuario: saturarían hardware):
-# - google/gemma-4-26b-a4b-qat  (26B dense — fuera)
-# - qwen/qwen3.6-35b-a3b       (35B MoE — fuera, user pidió 27b específicamente)
-# Regla usuario 2026-06-12: "usa qwen3.6-27b que ya está. usa ese y solo ese"
+# =====================================================================
+# Routing — keyword scoring for ask distribution
+# =====================================================================
+# 3 listas:
+#   code_keywords   → routed_to = "code"  (slave-b, qwen3.6-27b, ~5-10s)
+#   chat_keywords   → routed_to = "chat"  (slave-a, gemma4:12b-mlx, ~40-60s)
+#   general_penalty → routed_to = "general" (any node, or code as fallback)
+#
+# Cada keyword match cuenta +1 (case-insensitive, accent-insensitive).
+# Empate → code (slave-b es más rápido). Si ninguna matchea → "general"
+# (en lugar de "manual" como antes — el cluster ya no se queda colgado).
+# =====================================================================
 
 [routing]
-# Score por keyword; si supera umbral, va al slave. Empate → slave-b (código).
-# Threshold de score: si ninguno pasa, master te pregunta a vos.
 code_keywords = [
-  "código", "codigo", "code", "function", "función", "funcion",
-  "script", "python", "bash", "shell", "regex", "sed", "grep",
-  "commit", "git", "build", "compile", "error", "fix", "bug",
-  "refactor", "implement", "implementar", "agregar feature",
-  "install", "instalar", "npm", "pip", "package", "dependencia",
-  "api", "endpoint", "request", "response", "json", "yaml",
-  "html", "css", "jsx", "tsx", "astro", "react", "vue",
-  "docker", "container", "kubernetes", "deploy",
-  "test", "tests", "pytest", "unittest",
-  "delegar", "opencode", "subprocess", "import",
+  # Lenguajes y frameworks
+  "código", "codigo", "code", "function", "función", "funcion", "func",
+  "method", "método", "metodo", "class", "clase", "struct", "interface",
+  "script", "program", "programa",
+  "python", "py", "javascript", "js", "typescript", "ts", "java", "kotlin",
+  "rust", "go", "golang", "ruby", "php", "c++", "cpp", "rust",
+  "bash", "shell", "sh", "zsh", "fish",
+  "rust", "elixir", "haskell", "scala", "clojure", "erlang",
+  # Web
+  "html", "css", "scss", "sass", "less",
+  "jsx", "tsx", "astro", "react", "vue", "svelte", "angular",
+  "tailwind", "bootstrap", "materialize", "chakra",
+  "next", "next.js", "nuxt", "remix", "sveltekit", "gatsby",
+  # DevOps / tools
+  "regex", "sed", "grep", "awk", "cut", "sort", "uniq", "tr",
+  "docker", "container", "kubernetes", "k8s", "helm", "compose",
+  "terraform", "ansible", "pulumi",
+  "npm", "yarn", "pnpm", "pip", "poetry", "conda", "brew", "apt",
+  "package", "paquete", "dependencia", "dependency", "dependencies",
+  "venv", "virtualenv", "pyenv",
+  # Git / build / test
+  "git", "commit", "merge", "rebase", "branch", "rama", "tag", "release",
+  "build", "compile", "lint", "format", "prettier", "eslint",
+  "test", "tests", "pytest", "unittest", "jest", "mocha", "vitest",
+  "ci", "cd", "deploy", "rollback",
+  # Refactor / debug / patterns
+  "refactor", "refactoring", "rewrite", "reestructura", "restructure",
+  "implement", "implementar", "agregá", "agrega", "agregar", "add",
+  "fix", "bug", "error", "errror", "exception", "stacktrace",
+  "log", "logger", "logging", "debug", "print",
+  "async", "await", "promise", "callback",
+  "class", "object", "interface", "trait", "enum", "struct",
+  "import", "export", "require", "include", "using",
+  "api", "endpoint", "route", "router", "request", "response",
+  "json", "yaml", "toml", "xml", "csv", "html",
+  "json", "yaml", "toml",
+  # Misc dev terms
+  "opencode", "subprocess", "import", "delegate", "delegar",
+  "fix", "patch", "refactor", "implement",
 ]
 
 chat_keywords = [
-  "explicá", "explica", "explain", "qué es", "que es", "what is",
+  "explicá", "explica", "explain",
+  "qué es", "que es", "what is", "what's",
   "por qué", "porque", "why", "how", "cómo", "como",
-  "resumí", "resume", "summarize", "síntesis", "sintesis",
+  "resumí", "resume", "summarize",
   "reflexión", "reflexion", "thoughts", "opinión", "opinion",
   "analizá", "analiza", "analyze", "analizar", "pensá", "piensa",
   "compará", "compara", "compare", "diferencia", "difference",
   "plan", "estrategia", "strategy", "approach", "enfoque",
   "filosofía", "filosofia", "concepto", "concept", "teoría", "teoria",
+  "decime", "contame", "explicame", "qué pensás", "qué opinás",
+  "summary", "explain me", "tell me about",
+  "diferencia entre", "difference between",
+  "ventajas", "desventajas", "pros", "cons",
+  "recomendá", "recomienda", "recomendación", "recomendacion", "suggest",
+  "explicame cómo", "explain how",
+  "feedback", "review", "revisá", "revisame", "qué te parece",
 ]
 
-# Si el task contiene 'verbatim' o 'literal' → feedback verbatim, no síntesis
-verbatim_keywords = [
-  "verbatim", "literal", "text completo", "raw output", "crudo",
-  "explicá técnicamente", "explica técnicamente", "explicá a fondo",
-  "análisis profundo", "análisis técnico", "análisis detallado",
+# general_penalty: palabras que indican chitchat puro o acciones no
+# técnicas. Si SOLO matchean estas (sin code/chat), el routing va a
+# "general" (no a un slave específico). Esto evita que "hola" vaya a
+# slave-b y consuma 40s de inferencia para nada.
+general_penalty = [
+  "hola", "hi", "hello", "buenos días", "buenas tardes", "buenas noches",
+  "good morning", "good afternoon", "good evening", "good night",
+  "cómo estás", "como estas", "how are you", "qué tal", "que tal",
+  "chau", "adiós", "adios", "bye", "goodbye", "see you", "nos vemos",
+  "gracias", "thanks", "thank you", "muchas gracias", "ty",
+  "de nada", "you're welcome", "no worries",
+  "ok", "okay", "dale", "va", "listo", "ya", "bueno", "perfecto",
+  "jaja", "lol", "haha", "jeje", "😊", "👍",
 ]
 
 [feedback]
-mode_default = "synthesis"   # yo te resumo en 2-3 líneas
-mode_verbose = "verbatim"    # te pego la respuesta cruda
+mode_default = "synthesis"
+mode_verbose = "verbatim"
 synthesis_max_lines = 5
+
+# Regla usuario 2026-06-12: "usa qwen3.6-27b que ya está. usa ese y solo ese"
+
+[[node]]
+name = "slave-a"
+role = "chat_reflection"
+host = "192.168.1.123"
+port = 11434
+protocol = "ollama"
+base_url = "http://192.168.1.123:11434"
+model = "gemma4:12b-mlx"
+fallback_model = "llama3:latest"
+timeout_s = 120
+enabled = true
+purpose = "razonamiento general, reflexión, resúmenes, explicaciones"
+
+[[node]]
+name = "slave-b"
+role = "code_tools"
+host = "192.168.1.134"
+port = 1234
+protocol = "lmstudio"
+base_url = "http://192.168.1.134:1234/v1"
+model = "qwen/qwen3.6-27b"
+fallback_model = "qwen/qwen3.6-27b"
+timeout_s = 180
+enabled = true
+purpose = "código, comandos bash, iteración multi-step, tool calling"

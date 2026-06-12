@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+"""
+clusterctl — single-file CLI for the spids dev cluster.
+
+Manages a dynamic list of AI nodes (slaves + master) defined in a TOML
+config file. Supports CRUD operations on nodes, plus health checks and
+keyword-routed ask execution.
+
+Usage:
+  clusterctl health
+  clusterctl route "task text"
+  clusterctl ask "task text"
+  clusterctl nodes list
+  clusterctl nodes add <name> [--host 1.2.3.4] [--port 11434] [--model X]
+                            [--protocol ollama] [--role chat_reflection] [--timeout 120]
+                            [--base-url http://...]
+  clusterctl nodes remove <name>
+  clusterctl nodes enable <name>
+  clusterctl nodes disable <name>
+  clusterctl nodes get <name>
+
+Config file format (TOML):
+  [meta]
+  name = "spids-dev-cluster"
+  config_path = "/home/spids/cluster/cluster.toml"   # default
+  ...
+  [[node]]
+  name = "slave-a"
+  role = "chat_reflection"            # or "code_tools" / "general" / custom
+  host = "192.168.1.123"
+  port = 11434                        # optional
+  base_url = ""                       # optional, overrides host+port
+  protocol = "ollama"                 # ollama | lmstudio | hermes | openai | custom
+  model = "gemma4:12b-mlx"
+  timeout_s = 120
+  enabled = true
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+# Hindsight client is optional — if it fails to import, clusterctl still works
+# (just no memory features).
+try:
+    sys.path.insert(0, str(Path(__file__).parent))
+    import hindsight_client as hindsight
+    HINDSIGHT_ENABLED = True
+except Exception as _e:
+    HINDSIGHT_ENABLED = False
+    print(f"clusterctl: hindsight_client unavailable ({_e})", file=sys.stderr)
+
+try:
+    import tomllib  # py3.11+
+except ModuleNotFoundError:
+    sys.exit("clusterctl requires Python 3.11+ (uses tomllib)")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+log = logging.getLogger("clusterctl")
+
+CONFIG_PATH = Path(os.environ.get("CLUSTER_CONFIG", "/home/spids/cluster/cluster.toml"))
+LOG_PATH = Path("/home/spids/cluster/logs/ask.log")
+
+VALID_PROTOCOLS = {"ollama", "lmstudio", "hermes", "openai", "custom"}
+VALID_ROLES = {"chat_reflection", "code_tools", "general", "master"}
+
+
+# =====================
+# Config load/save
+# =====================
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {"meta": {"name": "spids-dev-cluster"}, "node": []}
+    with CONFIG_PATH.open("rb") as f:
+        return tomllib.load(f)
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Manual TOML writer (stdlib tomllib is read-only)
+    lines = []
+    if "meta" in cfg:
+        lines.append("[meta]")
+        for k, v in cfg["meta"].items():
+            lines.append(f'{k} = {toml_value(v)}')
+        lines.append("")
+    nodes = cfg.get("node", [])
+    for node in nodes:
+        lines.append("[[node]]")
+        for k, v in node.items():
+            lines.append(f'{k} = {toml_value(v)}')
+        lines.append("")
+    CONFIG_PATH.write_text("\n".join(lines))
+
+
+def toml_value(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, str):
+        return json.dumps(v)  # safe escaping
+    return json.dumps(v)
+
+
+def get_node(cfg: dict, name: str) -> dict | None:
+    for n in cfg.get("node", []):
+        if n.get("name") == name:
+            return n
+    return None
+
+
+def add_node(cfg: dict, **kwargs) -> dict:
+    name = kwargs.get("name")
+    if not name:
+        raise ValueError("name is required")
+    if get_node(cfg, name) is not None:
+        raise ValueError(f"node {name!r} already exists")
+    protocol = kwargs.get("protocol", "custom")
+    if protocol not in VALID_PROTOCOLS:
+        raise ValueError(f"protocol must be one of {sorted(VALID_PROTOCOLS)}")
+    role = kwargs.get("role", "general")
+    if role not in VALID_ROLES:
+        raise ValueError(f"role must be one of {sorted(VALID_ROLES)}")
+    node = {
+        "name": name,
+        "role": role,
+        "host": kwargs.get("host", "127.0.0.1"),
+        "port": int(kwargs.get("port", 0)) or None,
+        "base_url": kwargs.get("base_url", "") or None,
+        "protocol": protocol,
+        "model": kwargs.get("model", "") or None,
+        "timeout_s": int(kwargs.get("timeout_s", 120)),
+        "enabled": bool(kwargs.get("enabled", True)),
+    }
+    # Strip None values
+    node = {k: v for k, v in node.items() if v is not None}
+    cfg.setdefault("node", []).append(node)
+    save_config(cfg)
+    return node
+
+
+def remove_node(cfg: dict, name: str) -> bool:
+    nodes = cfg.get("node", [])
+    for i, n in enumerate(nodes):
+        if n.get("name") == name:
+            del nodes[i]
+            save_config(cfg)
+            return True
+    return False
+
+
+def set_node_enabled(cfg: dict, name: str, enabled: bool) -> dict | None:
+    n = get_node(cfg, name)
+    if n is None:
+        return None
+    n["enabled"] = enabled
+    save_config(cfg)
+    return n
+
+
+def resolve_base_url(node: dict) -> str:
+    if node.get("base_url"):
+        return node["base_url"].rstrip("/")
+    host = node.get("host", "127.0.0.1")
+    port = node.get("port")
+    proto = node.get("protocol", "custom")
+    if port:
+        return f"{proto}://{host}:{port}"
+    return f"{proto}://{host}"
+
+
+# =====================
+# Health check
+# =====================
+def check_node(node: dict) -> dict:
+    base = resolve_base_url(node)
+    proto = node.get("protocol", "custom")
+    timeout = node.get("timeout_s", 120)
+    t0 = time.time()
+    try:
+        if proto == "ollama":
+            url = base + "/api/tags"
+        elif proto == "lmstudio":
+            url = base + "/v1/models"
+        elif proto == "openai":
+            url = base + "/v1/models"
+        else:
+            url = base  # custom: just probe root
+        with urllib.request.urlopen(url, timeout=5) as r:
+            body = r.read()
+        latency_ms = round((time.time() - t0) * 1000, 1)
+        model_available = False
+        try:
+            payload = json.loads(body)
+            if proto in ("ollama",):
+                names = [m.get("name") for m in payload.get("models", [])]
+            elif proto in ("lmstudio", "openai"):
+                names = [m.get("id") for m in payload.get("data", [])]
+            else:
+                names = []
+            model_available = node.get("model", "") in names if node.get("model") else True
+        except (ValueError, KeyError):
+            names = []
+        return {
+            "name": node.get("name"),
+            "host": node.get("host"),
+            "protocol": proto,
+            "model": node.get("model", ""),
+            "ok": True,
+            "latency_ms": latency_ms,
+            "model_available": model_available,
+            "enabled": node.get("enabled", True),
+            "error": None,
+            "base_url": base,
+        }
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        return {
+            "name": node.get("name"),
+            "host": node.get("host"),
+            "protocol": proto,
+            "model": node.get("model", ""),
+            "ok": False,
+            "latency_ms": round((time.time() - t0) * 1000, 1),
+            "model_available": False,
+            "enabled": node.get("enabled", True),
+            "error": str(e)[:200],
+            "base_url": base,
+        }
+
+
+# =====================
+# Routing + Ask (existing logic, refactored to use cfg)
+# =====================
+def normalize(text: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", text.lower())
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def keyword_score(text: str, keywords: list) -> tuple:
+    norm = normalize(text)
+    matched = []
+    for kw in keywords:
+        nkw = normalize(kw)
+        if re.search(r"(?:^|\W)" + re.escape(nkw) + r"(?:$|\W)", norm):
+            matched.append(kw)
+    return len(matched), matched
+
+
+def route(text: str, cfg: dict) -> dict:
+    """Keyword scoring for routing.
+
+    Scoring:
+    - code_keywords: terms that indicate code/programming tasks
+    - chat_keywords: terms that indicate Q&A/explanation tasks
+    - general_penalty: terms that indicate pure chitchat (e.g. "hola",
+      "buenos días") — these bump the score to 0 so the ask goes to a
+      general node if one is available.
+
+    Returns: {routed_to, score_code, score_chat, score_general, matched_*}
+    routed_to ∈ {code, chat, general, manual}
+      - code:    any code keyword matched
+      - chat:    chat keyword matched AND no code keyword
+      - general: no keywords matched, but general node is available
+      - manual:  no keywords matched AND no general node
+    """
+    code_kw = cfg.get("routing", {}).get("code_keywords", [])
+    chat_kw = cfg.get("routing", {}).get("chat_keywords", [])
+    gen_pen = cfg.get("routing", {}).get("general_penalty", [])
+
+    norm = normalize(text)
+    sc, mc = keyword_score(text, code_kw)
+    sh, mh = keyword_score(text, chat_kw)
+    sp, mp = keyword_score(text, gen_pen)
+
+    # If penalty matches, it's small talk — don't trigger code or chat routing
+    if sp > 0 and sc == 0 and sh == 0:
+        picked = "general"
+    elif sc > sh:
+        picked = "code"
+    elif sh > sc:
+        picked = "chat"
+    elif sc == 0 and sh == 0:
+        picked = "general"  # fallback (was: manual)
+    else:
+        # tie — code wins (slave-b is faster, more deterministic)
+        picked = "code"
+
+    return {
+        "routed_to": picked,
+        "score_code": sc,
+        "score_chat": sh,
+        "score_general": sp,
+        "matched_code": mc,
+        "matched_chat": mh,
+        "matched_general": mp,
+    }
+
+
+def ask_node(node: dict, text: str) -> dict:
+    base = resolve_base_url(node)
+    proto = node.get("protocol", "custom")
+    timeout = node.get("timeout_s", 120)
+    model = node.get("model", "")
+    t0 = time.time()
+    try:
+        if proto == "ollama":
+            url = base + "/api/chat"
+            body = json.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": text}],
+                "stream": False,
+            }).encode()
+        else:  # lmstudio, openai, or custom — all openai-compatible
+            url = base + "/chat/completions"
+            body = json.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": text}],
+                "stream": False,
+            }).encode()
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            payload = json.loads(r.read().decode())
+        if proto == "ollama":
+            content = payload.get("message", {}).get("content", "")
+        else:
+            content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+        latency = round(time.time() - t0, 2)
+        return {"content": content, "latency_s": latency, "ok": True, "error": None}
+    except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError, KeyError) as e:
+        return {"content": "", "latency_s": round(time.time() - t0, 2), "ok": False, "error": str(e)[:200]}
+
+
+# =====================
+# CLI subcommands
+# =====================
+def cmd_health(cfg: dict) -> int:
+    out = {"cluster": cfg.get("meta", {}).get("name", "?"), "slaves": {}}
+    for n in cfg.get("node", []):
+        if n.get("enabled", True) is False:
+            continue
+        out["slaves"][n["name"]] = check_node(n)
+
+    # Hindsight node (always reported, independent of node list)
+    if HINDSIGHT_ENABLED:
+        h = hindsight.health()
+        stats = hindsight.stats()
+        nc = stats.get("node_count", 0)
+        out["slaves"]["hindsight"] = {
+            "name": "hindsight",
+            "host": "remote",
+            "protocol": "hindsight",
+            "model": f"{nc} nodes" if nc else "(empty)",
+            "ok": h.get("ok", False),
+            "latency_ms": h.get("latency_ms"),
+            "model_available": h.get("ok", False),
+            "enabled": True,
+            "error": h.get("error"),
+            "base_url": os.environ.get("HINDSIGHT_BASE", "http://127.0.0.1:8765"),
+            "memory_stats": stats,
+        }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_route(text: str, cfg: dict) -> int:
+    print(json.dumps(route(text, cfg), indent=2))
+    return 0
+
+
+def _pick_node(cfg: dict, decision: dict) -> dict | None:
+    """Pick a node from the cluster given a routing decision.
+
+    Priority:
+    1. First enabled node whose role matches the routing decision:
+       - routed_to=code    -> role in {code_tools, general, master, chat_reflection}
+         (we try code_tools first, then fall back to general)
+       - routed_to=chat    -> role in {chat_reflection, general, master}
+       - routed_to=general -> role in {general, master, anything}
+    2. If no role match, fall back to any enabled node (master > general > anything).
+    3. If still nothing, return None.
+    """
+    picked = decision["routed_to"]
+    role_priority = {
+        "code":    ["code_tools", "general", "master"],
+        "chat":    ["chat_reflection", "general", "master"],
+        "general": ["general", "master", "chat_reflection", "code_tools"],
+        "manual":  ["general", "master", "chat_reflection", "code_tools"],
+    }.get(picked, ["master", "general"])
+
+    nodes = [n for n in cfg.get("node", []) if n.get("enabled", True)]
+    # First pass: match by role
+    for role in role_priority:
+        for n in nodes:
+            if n.get("role") == role:
+                return n
+    # Second pass: any enabled node
+    return nodes[0] if nodes else None
+
+
+def cmd_ask(text: str, cfg: dict) -> int:
+    decision = route(text, cfg)
+    target = _pick_node(cfg, decision)
+    if target is None:
+        result = {"error": "no enabled node in cluster", "routing": decision}
+        print(json.dumps(result, indent=2))
+        return 1
+
+    result = ask_node(target, text)
+    log_line = (
+        f"slave={target['name']} model={target.get('model', '?')} "
+        f"latency={result['latency_s']}s routing={decision} "
+        f"task={text[:120]!r} preview={result.get('content','')[:200]!r}"
+    )
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_PATH.open("a") as f:
+        from datetime import datetime
+        f.write(f"{datetime.now().isoformat()} | {log_line}\n")
+    out = {
+        "routing": decision,
+        "node": target["name"],
+        "host": target.get("host"),
+        "model": target.get("model"),
+        "content": result.get("content", ""),
+        "latency_s": result.get("latency_s"),
+        "ok": result.get("ok"),
+        "error": result.get("error"),
+    }
+    print(json.dumps(out, indent=2))
+
+    # Auto-remember: write user prompt + assistant response to Hindsight on success.
+    # Fire-and-forget — if Hindsight is unreachable, log and move on.
+    if HINDSIGHT_ENABLED and result.get("ok"):
+        try:
+            content = (
+                f"USER ASK: {text}\n\n"
+                f"ROUTING: {decision.get('routed_to')} → {target['name']} ({target.get('model')})\n"
+                f"LATENCY: {result.get('latency_s')}s\n\n"
+                f"ASSISTANT RESPONSE:\n{result.get('content', '')}"
+            )
+            mem_id = hindsight.remember(
+                content,
+                metadata={
+                    "source": "spids-cluster",
+                    "node": target["name"],
+                    "model": target.get("model"),
+                    "routed_via": decision.get("routed_to"),
+                    "score_code": decision.get("score_code", 0),
+                    "score_chat": decision.get("score_chat", 0),
+                    "matched_code": decision.get("matched_code", []),
+                    "matched_chat": decision.get("matched_chat", []),
+                    "latency_s": result.get("latency_s"),
+                    "ts": int(time.time() * 1000),
+                },
+            )
+            if mem_id:
+                log.info("hindsight remember ok: %s", mem_id)
+            else:
+                log.debug("hindsight remember skipped (unreachable or error)")
+        except Exception as _e:
+            log.warning("hindsight remember failed: %s", _e)
+
+    return 0 if result.get("ok") else 1
+
+
+def cmd_nodes_list(cfg: dict) -> int:
+    nodes = cfg.get("node", [])
+    # Annotate each with live health
+    out = []
+    for n in nodes:
+        info = {**n, "health": check_node(n) if n.get("enabled", True) else {"ok": None, "error": "disabled"}}
+        out.append(info)
+    print(json.dumps({"cluster": cfg.get("meta", {}).get("name", "?"), "count": len(out), "nodes": out}, indent=2))
+    return 0
+
+
+def cmd_nodes_get(name: str, cfg: dict) -> int:
+    n = get_node(cfg, name)
+    if n is None:
+        print(json.dumps({"error": f"node {name!r} not found"}))
+        return 1
+    info = {**n, "health": check_node(n) if n.get("enabled", True) else {"ok": None}}
+    print(json.dumps(info, indent=2))
+    return 0
+
+
+def cmd_nodes_add(args, cfg: dict) -> int:
+    try:
+        node = add_node(cfg,
+                        name=args.name,
+                        host=args.host,
+                        port=args.port,
+                        base_url=args.base_url,
+                        protocol=args.protocol,
+                        model=args.model,
+                        role=args.role,
+                        timeout_s=args.timeout_s,
+                        enabled=not args.disabled)
+    except ValueError as e:
+        print(json.dumps({"error": str(e)}))
+        return 1
+    print(json.dumps({"added": node, "health": check_node(node) if node.get("enabled", True) else None}, indent=2))
+    return 0
+
+
+def cmd_nodes_remove(name: str, cfg: dict) -> int:
+    if not remove_node(cfg, name):
+        print(json.dumps({"error": f"node {name!r} not found"}))
+        return 1
+    print(json.dumps({"removed": name}))
+    return 0
+
+
+def cmd_nodes_enable(name: str, enabled: bool, cfg: dict) -> int:
+    n = set_node_enabled(cfg, name, enabled)
+    if n is None:
+        print(json.dumps({"error": f"node {name!r} not found"}))
+        return 1
+    print(json.dumps({"updated": n}, indent=2))
+    return 0
+
+
+# =====================
+# Main
+# =====================
+def main() -> int:
+    p = argparse.ArgumentParser(prog="clusterctl", description="spids dev cluster orchestrator")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("health", help="ping every enabled node")
+    pr = sub.add_parser("route", help="classify a task without sending")
+    pr.add_argument("text")
+    pa = sub.add_parser("ask", help="route + send to a node")
+    pa.add_argument("text")
+
+    # nodes subcommands
+    pn = sub.add_parser("nodes", help="manage cluster nodes")
+    pns = pn.add_subparsers(dest="nodes_cmd", required=True)
+    pns.add_parser("list", help="list all nodes + health")
+    png = pns.add_parser("get", help="show one node")
+    png.add_argument("name")
+    pna = pns.add_parser("add", help="add a new node")
+    pna.add_argument("name", help="unique node name")
+    pna.add_argument("--host", default="127.0.0.1")
+    pna.add_argument("--port", type=int, default=0, help="port (optional)")
+    pna.add_argument("--base-url", default="", help="full base URL (overrides host+port)")
+    pna.add_argument("--protocol", default="ollama", choices=sorted(VALID_PROTOCOLS))
+    pna.add_argument("--model", default="")
+    pna.add_argument("--role", default="general", choices=sorted(VALID_ROLES))
+    pna.add_argument("--timeout-s", type=int, default=120)
+    pna.add_argument("--disabled", action="store_true", help="add but don't enable")
+    pnr = pns.add_parser("remove", help="delete a node")
+    pnr.add_argument("name")
+    pne = pns.add_parser("enable", help="enable a node")
+    pne.add_argument("name")
+    pnd = pns.add_parser("disable", help="disable a node")
+    pnd.add_argument("name")
+
+    args = p.parse_args()
+    cfg = load_config()
+
+    if args.cmd == "health":
+        return cmd_health(cfg)
+    elif args.cmd == "route":
+        return cmd_route(args.text, cfg)
+    elif args.cmd == "ask":
+        return cmd_ask(args.text, cfg)
+    elif args.cmd == "nodes":
+        if args.nodes_cmd == "list":
+            return cmd_nodes_list(cfg)
+        elif args.nodes_cmd == "get":
+            return cmd_nodes_get(args.name, cfg)
+        elif args.nodes_cmd == "add":
+            return cmd_nodes_add(args, cfg)
+        elif args.nodes_cmd == "remove":
+            return cmd_nodes_remove(args.name, cfg)
+        elif args.nodes_cmd == "enable":
+            return cmd_nodes_enable(args.name, True, cfg)
+        elif args.nodes_cmd == "disable":
+            return cmd_nodes_enable(args.name, False, cfg)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
