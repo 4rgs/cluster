@@ -1,0 +1,71 @@
+Atomic task. Working dir: /home/spids/cluster. Use Python script in .stash/ and bash heredocs with single-quoted EOF markers. NEVER use write_file. NEVER use /tmp/.
+
+Build a self-contained Python CLI for a 2-slave AI cluster. Stdlib only.
+
+# Goal
+Create /home/spids/cluster/bin/clusterctl — a single Python file (executable, +x) that:
+1. Parses /home/spids/cluster/cluster.toml (use tomllib — it's stdlib in 3.11+)
+2. CLI subcommands: `clusterctl health`, `clusterctl ask "task text"`, `clusterctl route "task text"`
+3. `clusterctl route "text"` — keyword scoring against cluster.toml [routing].code_keywords and .chat_keywords. Returns JSON: {"routed_to": "slave-a"|"slave-b"|"manual", "score_code": N, "score_chat": N, "matched_code": [...], "matched_chat": [...]}
+4. `clusterctl ask "task text"` — routes the task, sends it to the chosen slave, returns raw response. Use urllib.request for HTTP (no requests lib). For Ollama slave-a: POST {base_url}/api/chat with {"model": "...", "messages": [{"role": "user", "content": "..."}], "stream": false}. For LM Studio slave-b: POST {base_url}/chat/completions with {"model": "...", "messages": [...], "stream": false}. Timeout: 120s for slave-a, 180s for slave-b. JSON output: {"slave": "slave-a"|"slave-b", "model": "...", "content": "...", "latency_s": N}
+5. `clusterctl health` — pings each slave's base_url (GET / for ollama returns OK, GET /v1/models for lmstudio). Verifies the configured model is loaded (compare to /api/tags or /v1/models output). JSON output per slave: {"name": "slave-a", "ok": true|false, "latency_ms": N, "model_available": true|false, "error": "..."}
+6. Log every ask() to /home/spids/cluster/logs/ask.log with timestamp, slave, model, task, latency, first 200 chars of response. Use logging module.
+
+# Hard rules
+- Single file at /home/spids/cluster/bin/clusterctl
+- Shebang: #!/usr/bin/env python3
+- chmod +x after creation
+- All paths absolute or relative to script location
+- Use tomllib (Python 3.11+) — check Python version first
+- Match case-insensitive AND accent-insensitive (normalize unicode: unicodedata.normalize('NFKD', text) + strip combining marks)
+- Score = number of DISTINCT keywords matched. Tie goes to slave-b (code). If both scores are 0, routed_to = "manual".
+
+# Steps
+Step 1: python3 --version (verify 3.11+)
+Step 2: cat > .stash/build_clusterctl.py << 'PYEOF'
+import subprocess, pathlib
+content = r'''#!/usr/bin/env python3
+# clusterctl — single-file CLI for the 2-slave cluster
+import sys
+import os
+import json
+import time
+import argparse
+import logging
+import unicodedata
+import urllib.request
+import urllib.error
+from pathlib import Path
+import tomllib
+
+CONFIG_PATH = Path("/home/spids/cluster/cluster.toml")
+LOG_PATH = Path("/home/spids/cluster/logs/ask.log")
+
+# === your full implementation here ===
+PYEOF
+pathlib.Path("/home/spids/cluster/bin/clusterctl").write_text(content)
+subprocess.run(["chmod", "+x", "/home/spids/cluster/bin/clusterctl"])
+print("WROTE", pathlib.Path("/home/spids/cluster/bin/clusterctl").stat().st_size, "bytes")
+PYEOF
+Step 3: python3 .stash/build_clusterctl.py
+Step 4: wc -l /home/spids/cluster/bin/clusterctl
+Step 5: /home/spids/cluster/bin/clusterctl route "explicá este código bash"  (expect slave-a, score_chat>=1)
+Step 6: /home/spids/cluster/bin/clusterctl route "agregá una función python al script"  (expect slave-b, score_code>=1)
+Step 7: /home/spids/cluster/bin/clusterctl route "hola"  (expect routed_to: manual)
+Step 8: /home/spids/cluster/bin/clusterctl health  (expect both ok, latency<200ms)
+Step 9: /home/spids/cluster/bin/clusterctl ask "respondé OK en una sola palabra"  (expect chat-routed, real content)
+Step 10: git add bin/ && git commit -m "cluster: clusterctl CLI with routing + ask + health" 2>&1 | tail -2
+Step 11: git log --oneline
+
+# Output requirements
+Report at the end:
+- Python version
+- File size and line count
+- Step 5 JSON
+- Step 6 JSON
+- Step 7 JSON
+- Step 8 JSON (both slaves)
+- Step 9 JSON (real ask, content)
+- Commit hash
+
+NOTE: the r''' string above is intentionally a SKELETON. Replace the # === your full implementation here === comment with the FULL ~300-line implementation that satisfies all the goals in the "Goal" section above.
