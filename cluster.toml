@@ -22,14 +22,15 @@ role = "code_tools"
 host = "192.168.1.134"
 protocol = "lmstudio"
 base_url = "http://192.168.1.134:1234/v1"
-model = "qwen/qwen3.6-27b"
-fallback_model = "qwen/qwen3.6-27b"  # único modelo liviano disponible
+model = "qwen/qwen3.6-27b"   # MoE ~3B activos, 27B totales — encaja en 32GB VRAM
+fallback_model = "qwen/qwen3.6-27b"
 purpose = "código, comandos bash, iteración multi-step, tool calling"
 timeout_s = 180
 
-# Modelos descartados explícitamente (saturan VRAM):
-# - google/gemma-4-26b-a4b-qat  (26B MoE — demasiado pesado)
-# - qwen/qwen3.6-35b-a3b       (35B MoE — demasiado pesado)
+# Modelos descartados explícitamente (usuario: saturarían hardware):
+# - google/gemma-4-26b-a4b-qat  (26B dense — fuera)
+# - qwen/qwen3.6-35b-a3b       (35B MoE — fuera, user pidió 27b específicamente)
+# Regla usuario 2026-06-12: "usa qwen3.6-27b que ya está. usa ese y solo ese"
 
 [routing]
 # Score por keyword; si supera umbral, va al slave. Empate → slave-b (código).
