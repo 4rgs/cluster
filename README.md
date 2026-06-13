@@ -26,11 +26,23 @@ on keyword scoring, tracks every ask, and persists data to a local store.
 The full install requires `cluster-web` to be available in parallel:
 
 ```sh
+curl -fsSL https://cluster.spids.cl/install.sh -o install.sh
+less install.sh
 sudo \
   INSTALL_DIR=/opt/cluster-web \
   CLUSTER_DIR=/opt/cluster \
   SERVICE_USER=clusteruser \
-  ./install.sh
+  bash install.sh
+```
+
+Or use the one-liner (review the script first if you care):
+
+```sh
+curl -fsSL https://cluster.spids.cl/install.sh | sudo \
+  INSTALL_DIR=/opt/cluster-web \
+  CLUSTER_DIR=/opt/cluster \
+  SERVICE_USER=clusteruser \
+  bash
 ```
 
 After install, run the configuration wizard to set up your first nodes:
