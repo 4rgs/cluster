@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hindsight_client — minimal client for the spids cluster to talk to a Hindsight
+hindsight_client — minimal client for the cluster to talk to a Hindsight
 memory server. Used by clusterctl to:
   1. Auto-remember every ask (user prompt + assistant response) on success
   2. Surface memory stats in the cluster health endpoint
@@ -23,7 +23,7 @@ import urllib.request
 from typing import Any
 
 HINDSIGHT_BASE = os.environ.get("HINDSIGHT_BASE", "http://127.0.0.1:8765")
-HINDSIGHT_BANK = os.environ.get("HINDSIGHT_BANK", "spids-cluster")
+HINDSIGHT_BANK = os.environ.get("HINDSIGHT_BANK", "cluster")
 DEFAULT_TIMEOUT = 5
 
 log = logging.getLogger("hindsight")

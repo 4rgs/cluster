@@ -1,36 +1,40 @@
-# Cluster de desarrollo — config de nodos
-# Schema: [meta] + [routing] + [feedback] + lista de [[node]]
-# Cada nodo tiene: name, role, host, port, base_url, protocol, model, timeout_s, enabled
-# Agregar nodos via: clusterctl nodes add <name> --host ... --protocol ... --model ...
+# Cluster configuration — node list and routing rules.
+#
+# This file is read by clusterctl on every health check and every ask.
+# Edit it directly, or use the wizard:
+#   sudo /opt/cluster/configure.sh
+#
+# The schema is [[node]] blocks; each block is a separate AI node.
+# Required: name, host, role, protocol, enabled.
+# Optional: port, base_url, model, token, timeout_s.
 
 [meta]
-name = "spids-dev-cluster"
+name = "my-cluster"
 created = "2026-06-12"
-constraint = "modelos livianos — no saturar hardware"
 
 # =====================================================================
 # Routing — keyword scoring for ask distribution
 # =====================================================================
-# 3 listas:
-#   code_keywords   → routed_to = "code"  (slave-b, qwen3.6-27b, ~5-10s)
-#   chat_keywords   → routed_to = "chat"  (slave-a, gemma4:12b-mlx, ~40-60s)
-#   general_penalty → routed_to = "general" (any node, or code as fallback)
+# 3 lists:
+#   code_keywords   → routed_to = "code"  (code_tools role)
+#   chat_keywords   → routed_to = "chat"  (chat_reflection role)
+#   general_penalty → routed_to = "general" (any role, prefer general)
 #
-# Cada keyword match cuenta +1 (case-insensitive, accent-insensitive).
-# Empate → code (slave-b es más rápido). Si ninguna matchea → "general"
-# (en lugar de "manual" como antes — el cluster ya no se queda colgado).
+# Each keyword match counts +1. Tie-breaker: code wins. If nothing
+# matches, the ask goes to a general-role node, or the first enabled
+# node as a last resort.
 # =====================================================================
 
 [routing]
 code_keywords = [
-  # Lenguajes y frameworks
+  # Languages
   "código", "codigo", "code", "function", "función", "funcion", "func",
   "method", "método", "metodo", "class", "clase", "struct", "interface",
   "script", "program", "programa",
   "python", "py", "javascript", "js", "typescript", "ts", "java", "kotlin",
-  "rust", "go", "golang", "ruby", "php", "c++", "cpp", "rust",
+  "rust", "go", "golang", "ruby", "php", "c++", "cpp",
   "bash", "shell", "sh", "zsh", "fish",
-  "rust", "elixir", "haskell", "scala", "clojure", "erlang",
+  "elixir", "haskell", "scala", "clojure", "erlang",
   # Web
   "html", "css", "scss", "sass", "less",
   "jsx", "tsx", "astro", "react", "vue", "svelte", "angular",
@@ -54,14 +58,10 @@ code_keywords = [
   "fix", "bug", "error", "errror", "exception", "stacktrace",
   "log", "logger", "logging", "debug", "print",
   "async", "await", "promise", "callback",
-  "class", "object", "interface", "trait", "enum", "struct",
   "import", "export", "require", "include", "using",
   "api", "endpoint", "route", "router", "request", "response",
-  "json", "yaml", "toml", "xml", "csv", "html",
-  "json", "yaml", "toml",
-  # Misc dev terms
-  "opencode", "subprocess", "import", "delegate", "delegar",
-  "fix", "patch", "refactor", "implement",
+  "json", "yaml", "toml", "xml", "csv",
+  "delegar", "opencode", "subprocess",
 ]
 
 chat_keywords = [
@@ -83,10 +83,8 @@ chat_keywords = [
   "feedback", "review", "revisá", "revisame", "qué te parece",
 ]
 
-# general_penalty: palabras que indican chitchat puro o acciones no
-# técnicas. Si SOLO matchean estas (sin code/chat), el routing va a
-# "general" (no a un slave específico). Esto evita que "hola" vaya a
-# slave-b y consuma 40s de inferencia para nada.
+# Pure chitchat — these bump the routing decision to "general" so
+# the ask doesn't waste cycles on a code/chat specialist.
 general_penalty = [
   "hola", "hi", "hello", "buenos días", "buenas tardes", "buenas noches",
   "good morning", "good afternoon", "good evening", "good night",
@@ -95,7 +93,7 @@ general_penalty = [
   "gracias", "thanks", "thank you", "muchas gracias", "ty",
   "de nada", "you're welcome", "no worries",
   "ok", "okay", "dale", "va", "listo", "ya", "bueno", "perfecto",
-  "jaja", "lol", "haha", "jeje", "😊", "👍",
+  "jaja", "lol", "haha", "jeje",
 ]
 
 [feedback]
@@ -103,30 +101,46 @@ mode_default = "synthesis"
 mode_verbose = "verbatim"
 synthesis_max_lines = 5
 
-# Regla usuario 2026-06-12: "usa qwen3.6-27b que ya está. usa ese y solo ese"
+# =====================================================================
+# Node examples — uncomment and edit, or run `configure.sh` to add.
+# =====================================================================
 
-[[node]]
-name = "slave-a"
-role = "chat_reflection"
-host = "192.168.1.123"
-port = 11434
-protocol = "ollama"
-base_url = "http://192.168.1.123:11434"
-model = "gemma4:12b-mlx"
-fallback_model = "llama3:latest"
-timeout_s = 120
-enabled = true
-purpose = "razonamiento general, reflexión, resúmenes, explicaciones"
+# Example 1: Ollama chat node
+#[[node]]
+#name = "chat-node"
+#role = "chat_reflection"
+#host = "node-host-or-ip"
+#port = 11434
+#protocol = "ollama"
+#base_url = ""  # leave blank to derive from host+port
+#model = "gemma4:12b-mlx"
+#timeout_s = 120
+#enabled = true
+#purpose = "razonamiento general, reflexión, resúmenes, explicaciones"
 
-[[node]]
-name = "slave-b"
-role = "code_tools"
-host = "192.168.1.134"
-port = 1234
-protocol = "lmstudio"
-base_url = "http://192.168.1.134:1234/v1"
-model = "qwen/qwen3.6-27b"
-fallback_model = "qwen/qwen3.6-27b"
-timeout_s = 180
-enabled = true
-purpose = "código, comandos bash, iteración multi-step, tool calling"
+# Example 2: LM Studio code node
+#[[node]]
+#name = "code-node"
+#role = "code_tools"
+#host = "node-host-or-ip"
+#port = 1234
+#protocol = "lmstudio"
+#base_url = ""  # set this for OpenAI-compatible proxies: http://host/v1
+#model = "your-code-model-name"
+#timeout_s = 180
+#enabled = true
+#purpose = "código, comandos bash, iteración multi-step, tool calling"
+
+# Example 3: OpenAI cloud node with Bearer auth
+#[[node]]
+#name = "openai-node"
+#role = "general"
+#host = "api.openai.com"
+#port = 443
+#protocol = "openai"
+#base_url = "https://api.openai.com/v1"
+#model = "gpt-4"
+#token = "sk-..."  # masked in API responses (***<last4>)
+#timeout_s = 60
+#enabled = true
+#purpose = "OpenAI cloud fallback"

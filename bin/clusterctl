@@ -142,6 +142,10 @@ def add_node(cfg: dict, **kwargs) -> dict:
         "timeout_s": int(kwargs.get("timeout_s", 120)),
         "enabled": bool(kwargs.get("enabled", True)),
     }
+    # Optional auth token (only included if non-empty)
+    token = kwargs.get("token", "").strip() if kwargs.get("token") else ""
+    if token:
+        node["token"] = token
     # Strip None values
     node = {k: v for k, v in node.items() if v is not None}
     cfg.setdefault("node", []).append(node)
@@ -180,12 +184,25 @@ def resolve_base_url(node: dict) -> str:
 
 
 # =====================
+# Auth headers
+# =====================
+def _auth_headers(node: dict) -> dict:
+    """Return Authorization headers for a node. If the node has a 'token' field,
+    uses Bearer auth. Empty dict otherwise (for unauthenticated local nodes)."""
+    token = node.get("token", "").strip()
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
+# =====================
 # Health check
 # =====================
 def check_node(node: dict) -> dict:
     base = resolve_base_url(node)
     proto = node.get("protocol", "custom")
     timeout = node.get("timeout_s", 120)
+    auth = _auth_headers(node)
     t0 = time.time()
     try:
         if proto == "ollama":
@@ -196,7 +213,8 @@ def check_node(node: dict) -> dict:
             url = base + "/v1/models"
         else:
             url = base  # custom: just probe root
-        with urllib.request.urlopen(url, timeout=5) as r:
+        req = urllib.request.Request(url, headers=auth)
+        with urllib.request.urlopen(req, timeout=5) as r:
             body = r.read()
         latency_ms = round((time.time() - t0) * 1000, 1)
         model_available = False
@@ -211,7 +229,7 @@ def check_node(node: dict) -> dict:
             model_available = node.get("model", "") in names if node.get("model") else True
         except (ValueError, KeyError):
             names = []
-        return {
+        out = {
             "name": node.get("name"),
             "host": node.get("host"),
             "protocol": proto,
@@ -223,8 +241,11 @@ def check_node(node: dict) -> dict:
             "error": None,
             "base_url": base,
         }
+        if node.get("token"):
+            out["auth"] = "bearer"  # surface that auth is configured (don't leak the token)
+        return out
     except (urllib.error.URLError, OSError, TimeoutError) as e:
-        return {
+        out = {
             "name": node.get("name"),
             "host": node.get("host"),
             "protocol": proto,
@@ -236,6 +257,13 @@ def check_node(node: dict) -> dict:
             "error": str(e)[:200],
             "base_url": base,
         }
+        # Surface 401 hints clearly
+        err_str = str(e)
+        if "401" in err_str or "Unauthorized" in err_str:
+            out["error"] = "401 Unauthorized — node requires auth but token is missing or wrong"
+        if node.get("token"):
+            out["auth"] = "bearer"
+        return out
 
 
 # =====================
@@ -311,6 +339,7 @@ def ask_node(node: dict, text: str) -> dict:
     proto = node.get("protocol", "custom")
     timeout = node.get("timeout_s", 120)
     model = node.get("model", "")
+    auth = _auth_headers(node)
     t0 = time.time()
     try:
         if proto == "ollama":
@@ -327,7 +356,7 @@ def ask_node(node: dict, text: str) -> dict:
                 "messages": [{"role": "user", "content": text}],
                 "stream": False,
             }).encode()
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", **auth})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             payload = json.loads(r.read().decode())
         if proto == "ollama":
@@ -337,7 +366,10 @@ def ask_node(node: dict, text: str) -> dict:
         latency = round(time.time() - t0, 2)
         return {"content": content, "latency_s": latency, "ok": True, "error": None}
     except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError, KeyError) as e:
-        return {"content": "", "latency_s": round(time.time() - t0, 2), "ok": False, "error": str(e)[:200]}
+        err = str(e)[:200]
+        if "401" in err or "Unauthorized" in err:
+            err = "401 Unauthorized — node requires auth but token is missing or wrong"
+        return {"content": "", "latency_s": round(time.time() - t0, 2), "ok": False, "error": err}
 
 
 # =====================
@@ -504,11 +536,16 @@ def cmd_nodes_add(args, cfg: dict) -> int:
                         model=args.model,
                         role=args.role,
                         timeout_s=args.timeout_s,
-                        enabled=not args.disabled)
+                        enabled=not args.disabled,
+                        token=args.token)
     except ValueError as e:
         print(json.dumps({"error": str(e)}))
         return 1
-    print(json.dumps({"added": node, "health": check_node(node) if node.get("enabled", True) else None}, indent=2))
+    out = {"added": node, "health": check_node(node) if node.get("enabled", True) else None}
+    # Don't echo the token in stdout
+    if "token" in out["added"]:
+        out["added"] = {**out["added"], "token": "***" + out["added"]["token"][-4:] if out["added"]["token"] else ""}
+    print(json.dumps(out, indent=2))
     return 0
 
 
@@ -557,6 +594,7 @@ def main() -> int:
     pna.add_argument("--model", default="")
     pna.add_argument("--role", default="general", choices=sorted(VALID_ROLES))
     pna.add_argument("--timeout-s", type=int, default=120)
+    pna.add_argument("--token", default="", help="optional API token (Bearer auth) for protected nodes")
     pna.add_argument("--disabled", action="store_true", help="add but don't enable")
     pnr = pns.add_parser("remove", help="delete a node")
     pnr.add_argument("name")
