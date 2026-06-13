@@ -1,146 +1,75 @@
-# Cluster configuration — node list and routing rules.
-#
-# This file is read by clusterctl on every health check and every ask.
-# Edit it directly, or use the wizard:
-#   sudo /opt/cluster/configure.sh
-#
-# The schema is [[node]] blocks; each block is a separate AI node.
-# Required: name, host, role, protocol, enabled.
-# Optional: port, base_url, model, token, timeout_s.
-
 [meta]
-name = "my-cluster"
+name = "local-models-cluster"
 created = "2026-06-12"
+constraint = "modelos livianos — no saturar hardware"
 
-# =====================================================================
-# Routing — keyword scoring for ask distribution
-# =====================================================================
-# 3 lists:
-#   code_keywords   → routed_to = "code"  (code_tools role)
-#   chat_keywords   → routed_to = "chat"  (chat_reflection role)
-#   general_penalty → routed_to = "general" (any role, prefer general)
-#
-# Each keyword match counts +1. Tie-breaker: code wins. If nothing
-# matches, the ask goes to a general-role node, or the first enabled
-# node as a last resort.
-# =====================================================================
-
+# Routing rules: keyword scoring. Each match adds a point. The ask goes
+# to whichever role has the highest score (code / chat / general).
+# This section is required for clusterctl `route` and `ask` to make
+# decisions. If missing, every ask defaults to `general`.
 [routing]
 code_keywords = [
-  # Languages
-  "código", "codigo", "code", "function", "función", "funcion", "func",
-  "method", "método", "metodo", "class", "clase", "struct", "interface",
-  "script", "program", "programa",
-  "python", "py", "javascript", "js", "typescript", "ts", "java", "kotlin",
-  "rust", "go", "golang", "ruby", "php", "c++", "cpp",
-  "bash", "shell", "sh", "zsh", "fish",
-  "elixir", "haskell", "scala", "clojure", "erlang",
-  # Web
-  "html", "css", "scss", "sass", "less",
-  "jsx", "tsx", "astro", "react", "vue", "svelte", "angular",
-  "tailwind", "bootstrap", "materialize", "chakra",
-  "next", "next.js", "nuxt", "remix", "sveltekit", "gatsby",
-  # DevOps / tools
-  "regex", "sed", "grep", "awk", "cut", "sort", "uniq", "tr",
-  "docker", "container", "kubernetes", "k8s", "helm", "compose",
-  "terraform", "ansible", "pulumi",
-  "npm", "yarn", "pnpm", "pip", "poetry", "conda", "brew", "apt",
-  "package", "paquete", "dependencia", "dependency", "dependencies",
-  "venv", "virtualenv", "pyenv",
-  # Git / build / test
-  "git", "commit", "merge", "rebase", "branch", "rama", "tag", "release",
-  "build", "compile", "lint", "format", "prettier", "eslint",
-  "test", "tests", "pytest", "unittest", "jest", "mocha", "vitest",
-  "ci", "cd", "deploy", "rollback",
-  # Refactor / debug / patterns
-  "refactor", "refactoring", "rewrite", "reestructura", "restructure",
-  "implement", "implementar", "agregá", "agrega", "agregar", "add",
-  "fix", "bug", "error", "errror", "exception", "stacktrace",
-  "log", "logger", "logging", "debug", "print",
-  "async", "await", "promise", "callback",
-  "import", "export", "require", "include", "using",
-  "api", "endpoint", "route", "router", "request", "response",
-  "json", "yaml", "toml", "xml", "csv",
-  "delegar", "opencode", "subprocess",
+  "python", "py", "javascript", "js", "typescript", "ts", "rust", "go", "java", "kotlin",
+  "swift", "ruby", "php", "html", "css", "sql", "bash", "shell", "sh", "zsh",
+  "code", "function", "función", "func", "method", "método", "class", "clase",
+  "variable", "const", "let", "def ", "fn ", "func ", "import ", "export ",
+  "compile", "compilar", "build", "test", "tests",
+  "refactor", "refactorizar", "fix", "arreglar", "bug",
+  "regex", "json", "yaml", "toml", "xml", "docker", "dockerfile",
+  "kubernetes", "k8s", "ansible", "terraform", "makefile", "cmake",
+  "iteración", "iteration", "loop", "bucle", "array", "lista",
+  "objeto", "object", "struct", "enum", "trait", "interface", "tipo", "type",
+  "algoritmo", "algorithm", "sort", "recursión", "recursion",
+  "agregá", "agrega", "añadí", "añade", "add", "implementa", "implement",
+  "escribí", "escribe", "write", "hazme", "create", "crea", "armá", "arma",
+  "cambiá", "cambia", "change", "update", "actualiza", "modify", "modificá",
+  "borrá", "borra", "delete", "remove", "eliminá", "elimina",
+  "parse", "parcé", "parsea", "encode", "decode", "hash",
+  "api", "endpoint", "route", "middleware", "handler", "controller",
+  "git", "commit", "branch", "merge", "rebase",
+  "npm", "pip", "cargo", "mvn", "gradle", "brew", "apt", "yum", "pacman",
 ]
-
 chat_keywords = [
-  "explicá", "explica", "explain",
-  "qué es", "que es", "what is", "what's",
-  "por qué", "porque", "why", "how", "cómo", "como",
-  "resumí", "resume", "summarize",
-  "reflexión", "reflexion", "thoughts", "opinión", "opinion",
-  "analizá", "analiza", "analyze", "analizar", "pensá", "piensa",
-  "compará", "compara", "compare", "diferencia", "difference",
-  "plan", "estrategia", "strategy", "approach", "enfoque",
-  "filosofía", "filosofia", "concepto", "concept", "teoría", "teoria",
-  "decime", "contame", "explicame", "qué pensás", "qué opinás",
-  "summary", "explain me", "tell me about",
-  "diferencia entre", "difference between",
-  "ventajas", "desventajas", "pros", "cons",
-  "recomendá", "recomienda", "recomendación", "recomendacion", "suggest",
-  "explicame cómo", "explain how",
-  "feedback", "review", "revisá", "revisame", "qué te parece",
+  "explicá", "explica", "explain", "describe", "describí", "what is", "qué es",
+  "por qué", "why", "how does", "cómo", "para qué", "what's", "cuál es",
+  "decime", "dime", "tell me", "say", "di ", "tell ",
+  "feedback", "review", "revisá", "opinión", "opinion", "pensás", "pensar",
+  "plan", "planificá", "outline", "resumen", "summary",
+  "summarize", "resumí", "explicame", "explícame", "translate", "traducí", "traduce",
+  "diferencia", "difference", "compará", "compare", "versus",
+  "ventaja", "desventaja", "pro", "con", "pros", "cons",
+  "hola", "hi", "hello", "buenos", "buenas", "qué tal",
+  "thank", "gracias", "thanks", "thx", "bye", "chau",
+  "ayuda", "help", "asistirme", "assist",
 ]
-
-# Pure chitchat — these bump the routing decision to "general" so
-# the ask doesn't waste cycles on a code/chat specialist.
 general_penalty = [
-  "hola", "hi", "hello", "buenos días", "buenas tardes", "buenas noches",
-  "good morning", "good afternoon", "good evening", "good night",
-  "cómo estás", "como estas", "how are you", "qué tal", "que tal",
-  "chau", "adiós", "adios", "bye", "goodbye", "see you", "nos vemos",
-  "gracias", "thanks", "thank you", "muchas gracias", "ty",
-  "de nada", "you're welcome", "no worries",
-  "ok", "okay", "dale", "va", "listo", "ya", "bueno", "perfecto",
-  "jaja", "lol", "haha", "jeje",
+  "hola", "hi ", "hello", "buenos", "buenas", "qué tal", "como estas",
+  "cómo estás", "how are you", "thanks", "gracias", "ok", "okay", "vale",
+  "jaja", "lol", "jeje", "haha",
 ]
 
-[feedback]
-mode_default = "synthesis"
-mode_verbose = "verbatim"
-synthesis_max_lines = 5
+[[node]]
+name = "slave-a"
+role = "chat_reflection"
+host = "192.168.1.123"
+port = 11434
+protocol = "ollama"
+base_url = "http://192.168.1.123:11434"
+model = "gemma4:12b-mlx"
+fallback_model = "llama3:latest"
+timeout_s = 120
+enabled = true
+purpose = "razonamiento general, reflexión, resúmenes, explicaciones"
 
-# =====================================================================
-# Node examples — uncomment and edit, or run `configure.sh` to add.
-# =====================================================================
-
-# Example 1: Ollama chat node
-#[[node]]
-#name = "chat-node"
-#role = "chat_reflection"
-#host = "node-host-or-ip"
-#port = 11434
-#protocol = "ollama"
-#base_url = ""  # leave blank to derive from host+port
-#model = "gemma4:12b-mlx"
-#timeout_s = 120
-#enabled = true
-#purpose = "razonamiento general, reflexión, resúmenes, explicaciones"
-
-# Example 2: LM Studio code node
-#[[node]]
-#name = "code-node"
-#role = "code_tools"
-#host = "node-host-or-ip"
-#port = 1234
-#protocol = "lmstudio"
-#base_url = ""  # set this for OpenAI-compatible proxies: http://host/v1
-#model = "your-code-model-name"
-#timeout_s = 180
-#enabled = true
-#purpose = "código, comandos bash, iteración multi-step, tool calling"
-
-# Example 3: OpenAI cloud node with Bearer auth
-#[[node]]
-#name = "openai-node"
-#role = "general"
-#host = "api.openai.com"
-#port = 443
-#protocol = "openai"
-#base_url = "https://api.openai.com/v1"
-#model = "gpt-4"
-#token = "sk-..."  # masked in API responses (***<last4>)
-#timeout_s = 60
-#enabled = true
-#purpose = "OpenAI cloud fallback"
+[[node]]
+name = "slave-b"
+role = "code_tools"
+host = "192.168.1.134"
+port = 1234
+protocol = "lmstudio"
+base_url = "http://192.168.1.134:1234/v1"
+model = "qwen/qwen3.6-27b"
+fallback_model = "qwen/qwen3.6-27b"
+timeout_s = 180
+enabled = true
+purpose = "código, comandos bash, iteración multi-step, tool calling"

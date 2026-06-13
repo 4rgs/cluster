@@ -195,6 +195,27 @@ def _auth_headers(node: dict) -> dict:
     return {}
 
 
+def _endpoint_url(base: str, suffix: str) -> str:
+    """Build a URL by appending `suffix` to `base`, but only if `base` doesn't
+    already end with the suffix's first path segment. This handles the case
+    where the user has configured `base_url = "http://...:1234/v1"` (e.g. for
+    LM Studio, OpenAI-compatible servers) — we must not double the /v1.
+
+    Examples:
+        base = "http://x:1234",         suffix = "/v1/models"  -> "http://x:1234/v1/models"
+        base = "http://x:1234/v1",      suffix = "/v1/models"  -> "http://x:1234/v1/models"
+        base = "http://x:11434",        suffix = "/api/tags"   -> "http://x:11434/api/tags"
+        base = "http://x:1234/v1",      suffix = "/chat/completions" -> "http://x:1234/v1/chat/completions"
+    """
+    base = base.rstrip("/")
+    suffix = suffix if suffix.startswith("/") else "/" + suffix
+    # Extract the first path segment of the suffix
+    suffix_first_segment = "/" + suffix.lstrip("/").split("/")[0]
+    if base.endswith(suffix_first_segment):
+        return base + suffix[len(suffix_first_segment):]
+    return base + suffix
+
+
 # =====================
 # Health check
 # =====================
@@ -206,13 +227,11 @@ def check_node(node: dict) -> dict:
     t0 = time.time()
     try:
         if proto == "ollama":
-            url = base + "/api/tags"
-        elif proto == "lmstudio":
-            url = base + "/v1/models"
-        elif proto == "openai":
-            url = base + "/v1/models"
+            url = _endpoint_url(base, "/api/tags")
+        elif proto in ("lmstudio", "openai"):
+            url = _endpoint_url(base, "/v1/models")
         else:
-            url = base  # custom: just probe root
+            url = _endpoint_url(base, "/")  # custom: just probe root
         req = urllib.request.Request(url, headers=auth)
         with urllib.request.urlopen(req, timeout=5) as r:
             body = r.read()
@@ -343,14 +362,14 @@ def ask_node(node: dict, text: str) -> dict:
     t0 = time.time()
     try:
         if proto == "ollama":
-            url = base + "/api/chat"
+            url = _endpoint_url(base, "/api/chat")
             body = json.dumps({
                 "model": model,
                 "messages": [{"role": "user", "content": text}],
                 "stream": False,
             }).encode()
         else:  # lmstudio, openai, or custom — all openai-compatible
-            url = base + "/chat/completions"
+            url = _endpoint_url(base, "/chat/completions")
             body = json.dumps({
                 "model": model,
                 "messages": [{"role": "user", "content": text}],
