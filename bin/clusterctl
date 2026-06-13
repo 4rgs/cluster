@@ -433,7 +433,7 @@ def _pick_node(cfg: dict, decision: dict) -> dict | None:
 
     Priority:
     1. First enabled node whose role matches the routing decision:
-       - routed_to=code    -> role in {code_tools, general, master, chat_reflection}
+       - routed_to=code    -> role in {code_tools, general, master}
          (we try code_tools first, then fall back to general)
        - routed_to=chat    -> role in {chat_reflection, general, master}
        - routed_to=general -> role in {general, master, anything}
@@ -458,6 +458,357 @@ def _pick_node(cfg: dict, decision: dict) -> dict | None:
     return nodes[0] if nodes else None
 
 
+# =====================
+# Master orchestration
+# =====================
+def should_decompose(text: str, cfg: dict) -> bool:
+    """Decide whether an ask is long/complex enough to warrant splitting
+    into subtasks. Heuristic: length + presence of multi-step language.
+
+    Set CLUSTER_DECOMPOSE_DISABLED=1 to opt out (handy for ad-hoc testing).
+    Set CLUSTER_DECOMPOSE_MIN_CHARS=NNN to tune the length threshold.
+    """
+    if os.environ.get("CLUSTER_DECOMPOSE_DISABLED") == "1":
+        return False
+    min_chars = int(os.environ.get("CLUSTER_DECOMPOSE_MIN_CHARS", "120"))
+    if len(text) < min_chars:
+        return False
+    import re
+    text_l = text.lower()
+    # Multi-step signals (Spanish + English). Use regex with word boundaries
+    # so "y luego" matches "Y luego, haz X" or ". Y luego, haz Y" both.
+    patterns = [
+        r"\bprimero\b", r"\bsegundo\b", r"\btercero\b",
+        r"\bprimera\b", r"\bsegunda\b", r"\btercera\b",
+        r"\bpaso\s*\d+\b", r"\bstep\s*\d+\b",
+        r"\b1\)", r"\b2\)", r"\b3\)", r"\b4\)",
+        r"\b\d+\.\s",          # "1. ", "2. ", etc.
+        r"\b[Yy]\s+luego\b", r"\b[Yy]\s+despu[ée]s\b",
+        r"\band then\b", r"\bfirst\b", r"\bsecond\b", r"\bthird\b",
+        r"\b[aá]dem[aá]s\b", r"\basimismo\b", r"\bpor [uú]ltimo\b",
+        r"\bfinally\b", r"\balso\b", r"\bnext\b", r"\bthen\b",
+    ]
+    n_signals = sum(1 for p in patterns if re.search(p, text_l))
+    return n_signals >= 2
+
+
+def cmd_ask_orchestrated(text: str, cfg: dict, decision: dict) -> int:
+    """Master orchestrator: decompose → parallel run → synthesize.
+
+    Steps:
+    1. Plan: ask the fastest available node to split the ask into 2-4
+       self-contained subtasks. The plan is JSON.
+    2. Dispatch: route each subtask independently to the right slave
+       and run them in parallel. The total wall time is roughly
+       max(slave latencies), not the sum.
+    3. Synthesize: ask the fastest node to merge the subtask answers
+       into a single coherent response.
+    """
+    t_start = time.time()
+    # Use the fastest enabled node for the meta-tasks (plan + synthesis).
+    # Order: code_tools (lmstudio/qwen) is usually 3-10s; chat_reflection
+    # (gemma4) is 30-90s. We pick whichever is faster.
+    plan_node = _pick_fastest_node(cfg) or _pick_node_for_role(cfg, "chat_reflection")
+    if not plan_node:
+        # Fall back to single-ask path
+        target = _pick_node(cfg, decision)
+        if not target:
+            print(json.dumps({"error": "no enabled node for orchestration", "routing": decision}, indent=2))
+            return 1
+        result = ask_node(target, text)
+        return _finish_ask_log(text, decision, [target["name"]], result, [text], [result.get("content", "")], None, t_start)
+
+    # Step 1: plan decomposition (use a low max_tokens to keep it fast)
+    plan_prompt = build_plan_prompt(text)
+    plan_result = _ask_node_quick(plan_node, plan_prompt, max_tokens=512)
+    if not plan_result.get("ok"):
+        # Fall back to single-ask path
+        target = _pick_node(cfg, decision)
+        if not target:
+            print(json.dumps({"error": "no enabled node and planner failed", "planner_error": plan_result.get("error")}, indent=2))
+            return 1
+        result = ask_node(target, text)
+        return _finish_ask_log(text, decision, [target["name"]], result, [text], [result.get("content", "")], None, t_start)
+
+    subtasks = parse_subtask_plan(plan_result.get("content", ""))
+    if not subtasks or len(subtasks) < 2:
+        # Planner didn't produce a plan — fall through
+        target = _pick_node(cfg, decision)
+        if not target:
+            print(json.dumps({"error": "planner returned no subtasks", "planner_response": plan_result.get("content", "")[:500]}, indent=2))
+            return 1
+        result = ask_node(target, text)
+        return _finish_ask_log(text, decision, [target["name"]], result, [text], [result.get("content", "")], None, t_start)
+
+    # Cap to 4 subtasks
+    subtasks = subtasks[:4]
+    log.info("orchestrator: plan returned %d subtasks", len(subtasks))
+
+    # Step 2: parallel dispatch
+    import concurrent.futures
+    sub_results: list[tuple[dict, str, str, dict]] = []  # (node, sub, response, dispatch_decision)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(subtasks)) as pool:
+        futures = {}
+        for sub in subtasks:
+            sub_decision = route(sub, cfg)
+            sub_node = _pick_node(cfg, sub_decision)
+            if not sub_node:
+                continue
+            futures[pool.submit(ask_node, sub_node, sub)] = (sub_node, sub, sub_decision)
+        for fut in concurrent.futures.as_completed(futures):
+            node, sub, sub_decision = futures[fut]
+            try:
+                r = fut.result()
+            except Exception as e:
+                r = {"ok": False, "error": str(e), "content": "", "latency_s": 0}
+            sub_results.append((node, sub, r, sub_decision))
+
+    sub_results.sort(key=lambda x: x[0]["name"])  # stable order by node name
+    sub_nodes = [n["name"] for n, _, _, _ in sub_results]
+    sub_inputs = [s for _, s, _, _ in sub_results]
+    sub_outputs = [r.get("content", "") for _, _, r, _ in sub_results]
+
+    # Step 3: synthesize (reuse plan_node for speed, with bigger context)
+    synth_prompt = build_synth_prompt(text, list(zip(sub_inputs, sub_outputs, sub_nodes)))
+    synth_result = _ask_node_quick(plan_node, synth_prompt, max_tokens=2048)
+    final_content = synth_result.get("content", "") if synth_result.get("ok") else synthesize_fallback(text, sub_inputs, sub_outputs, sub_nodes)
+
+    # Build the orchestration result
+    total_latency = round(time.time() - t_start, 2)
+    out = {
+        "ok": synth_result.get("ok", False) or any(r.get("ok") for _, _, r, _ in sub_results),
+        "orchestrated": True,
+        "subtasks": [
+            {
+                "node": n["name"],
+                "routing": d.get("routed_to"),
+                "input": s,
+                "output": r.get("content", ""),
+                "latency_s": r.get("latency_s"),
+                "ok": r.get("ok", False),
+                "error": r.get("error"),
+            } for (n, s, r, d) in sub_results
+        ],
+        "synthesis_node": synth_node["name"],
+        "synthesis_latency_s": synth_result.get("latency_s"),
+        "content": final_content,
+        "total_latency_s": total_latency,
+        "latency_s": total_latency,
+        "node": synth_node["name"],
+        "model": synth_node.get("model"),
+        "routing": decision,
+        "plan_response": plan_result.get("content", "")[:500],
+    }
+    if synth_result.get("error"):
+        out["synthesis_error"] = synth_result["error"]
+
+    # Log orchestration
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_PATH.open("a") as f:
+        from datetime import datetime
+        f.write(f"{datetime.now().isoformat()} | ORCHESTRATED task={text[:120]!r} subtasks={sub_nodes} "
+                f"plan_node={plan_node['name']} synth_node={synth_node['name']} "
+                f"total_latency={total_latency}s\n")
+        for (n, s, r, d) in sub_results:
+            f.write(f"  {datetime.now().isoformat()} |   subtask slave={n['name']} "
+                    f"routing={d.get('routed_to')} latency={r.get('latency_s')}s ok={r.get('ok')} "
+                    f"input={s[:80]!r} output_preview={r.get('content','')[:120]!r}\n")
+
+    # Hindsight remember
+    if HINDSIGHT_ENABLED and out["ok"]:
+        try:
+            content = (
+                f"USER ASK (ORCHESTRATED): {text}\n\n"
+                f"SUBTASKS:\n" + "\n".join(f"- {s}" for s in sub_inputs) + "\n\n"
+                f"FINAL RESPONSE:\n{final_content}"
+            )
+            mem_id = hindsight.remember(
+                content,
+                metadata={
+                    "source": "spids-cluster",
+                    "orchestrated": True,
+                    "subtask_count": len(sub_inputs),
+                    "subtask_nodes": sub_nodes,
+                    "ts": int(time.time() * 1000),
+                },
+            )
+            if mem_id:
+                log.info("hindsight remember ok: %s", mem_id)
+        except Exception as _e:
+            log.warning("hindsight remember failed: %s", _e)
+
+    print(json.dumps(out, indent=2))
+    return 0 if out["ok"] else 1
+
+
+def _pick_node_for_role(cfg: dict, role: str) -> dict | None:
+    """Find the first enabled node with the given role."""
+    for n in cfg.get("node", []):
+        if n.get("enabled", True) and n.get("role") == role:
+            return n
+    return None
+
+
+def _pick_fastest_node(cfg: dict) -> dict | None:
+    """Return the enabled node best suited for orchestration meta-tasks.
+
+    The planner and synthesizer run small, structured-output tasks where
+    reasoning quality matters more than raw speed. We prefer
+    chat_reflection (gemma4:12b-mlx on slave-a, which has thinking
+    enabled and handles reasoning well) over code_tools (lmstudio, fast
+    but less reliable at JSON output for meta-tasks).
+    """
+    nodes = [n for n in cfg.get("node", []) if n.get("enabled", True)]
+    if not nodes:
+        return None
+    # Prefer chat_reflection (gemma4 with thinking) for the meta-tasks
+    for role in ("chat_reflection", "general", "code_tools", "master"):
+        for n in nodes:
+            if n.get("role") == role:
+                return n
+    return nodes[0]
+
+
+def _ask_node_quick(node: dict, text: str, max_tokens: int = 1024) -> dict:
+    """Like ask_node but with explicit max_tokens cap for the orchestration
+    meta-tasks (plan and synthesis) where we want a fast, focused response
+    rather than a long-form answer."""
+    base = resolve_base_url(node)
+    proto = node.get("protocol", "custom")
+    timeout = node.get("timeout_s", 120)
+    model = node.get("model", "")
+    auth = _auth_headers(node)
+    t0 = time.time()
+    try:
+        if proto == "ollama":
+            url = _endpoint_url(base, "/api/chat")
+            body = json.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": text}],
+                "stream": False,
+                "options": {"num_predict": max_tokens},
+            }).encode()
+        else:
+            url = _endpoint_url(base, "/chat/completions")
+            body = json.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": text}],
+                "stream": False,
+                "max_tokens": max_tokens,
+            }).encode()
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", **auth})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            payload = json.loads(r.read().decode())
+        if proto == "ollama":
+            content = payload.get("message", {}).get("content", "")
+        else:
+            content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+        latency = round(time.time() - t0, 2)
+        # Cache latency for future _pick_fastest_node calls
+        node["last_latency_ms"] = int(latency * 1000)
+        return {"content": content, "latency_s": latency, "ok": True, "error": None}
+    except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError, KeyError) as e:
+        err = str(e)[:200]
+        if "401" in err or "Unauthorized" in err:
+            err = "401 Unauthorized — node requires auth but token is missing or wrong"
+        return {"content": "", "latency_s": round(time.time() - t0, 2), "ok": False, "error": err}
+
+
+def _finish_ask_log(text, decision, nodes, result, sub_inputs, sub_outputs, synth_node, t_start):
+    """Helper to log a non-orchestrated ask that was used as fallback."""
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_PATH.open("a") as f:
+        from datetime import datetime
+        f.write(f"{datetime.now().isoformat()} | FALLBACK_SIMPLE_ASK slave={nodes[0]} "
+                f"latency={result.get('latency_s')}s routing={decision} task={text[:120]!r}\n")
+    out = {
+        "ok": result.get("ok", False),
+        "orchestrated": False,
+        "content": result.get("content", ""),
+        "latency_s": result.get("latency_s"),
+        "node": nodes[0] if nodes else None,
+        "model": result.get("model"),
+        "routing": decision,
+        "error": result.get("error"),
+    }
+    print(json.dumps(out, indent=2))
+    return 0 if out["ok"] else 1
+
+
+def build_plan_prompt(user_text: str) -> str:
+    """Build the prompt that asks the planning LLM to decompose the task."""
+    return (
+        "You are a master orchestrator. Break the user's task into 2-4 self-contained "
+        "subtasks. Each subtask goes to either code_tools or chat_reflection.\n\n"
+        "Output JSON only:\n"
+        '{"subtasks": [{"task": "..."}, {"task": "..."}]}\n\n'
+        "Each task is self-contained (don't reference 'previous answer'). Fewer than "
+        "2 means the task is simple. Order matters (earlier ones first).\n\n"
+        f"TASK: {user_text}\n"
+        "JSON:"
+    )
+
+
+def build_synth_prompt(user_text: str, sub_results: list) -> str:
+    """Build the prompt that asks the LLM to consolidate subtask answers."""
+    parts = []
+    for i, (sub_in, sub_out, node) in enumerate(sub_results, 1):
+        parts.append(f"### {i} ({node}): {sub_in}\n{sub_out}\n")
+    sub_block = "\n".join(parts)
+    return (
+        "You are a master synthesizer. Combine the subtask answers below into ONE "
+        "clear final response. Keep code blocks intact. Don't mention the orchestration.\n\n"
+        f"QUESTION: {user_text}\n\n"
+        f"ANSWERS:\n{sub_block}\n\n"
+        "FINAL:"
+    )
+
+
+def synthesize_fallback(user_text, sub_inputs, sub_outputs, sub_nodes):
+    """If the synthesis node fails, concatenate the subtask answers with light framing."""
+    parts = []
+    for i, (sub_in, sub_out, node) in enumerate(zip(sub_inputs, sub_outputs, sub_nodes), 1):
+        parts.append(f"## Subtask {i} ({node}): {sub_in}\n\n{sub_out}\n")
+    return "\n\n---\n\n".join(parts)
+
+
+def parse_subtask_plan(content: str) -> list[str]:
+    """Extract a list of self-contained subtask strings from the planner LLM.
+    Tolerant: handles JSON with or without 'why_code' fields, with code fences,
+    or with leading prose. Falls back to empty list if nothing usable."""
+    if not content:
+        return []
+    import re
+    text = content.strip()
+    # Strip ```json fences if present
+    fence_m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence_m:
+        text = fence_m.group(1)
+    # Try strict parse
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and isinstance(obj.get("subtasks"), list):
+            tasks = []
+            for st in obj["subtasks"]:
+                if isinstance(st, dict) and st.get("task"):
+                    tasks.append(str(st["task"]))
+                elif isinstance(st, str):
+                    tasks.append(st)
+            return [t for t in tasks if t.strip()]
+    except (ValueError, AttributeError):
+        pass
+    # Try to find a JSON object in the text
+    obj_m = re.search(r"\{[^{}]*\"subtasks\"[^{}]*\[.*?\][^{}]*\}", text, re.DOTALL)
+    if obj_m:
+        try:
+            obj = json.loads(obj_m.group(0))
+            if isinstance(obj, dict) and isinstance(obj.get("subtasks"), list):
+                return [str(st.get("task") if isinstance(st, dict) else st) for st in obj["subtasks"]]
+        except ValueError:
+            pass
+    return []
+
+
 def cmd_ask(text: str, cfg: dict) -> int:
     decision = route(text, cfg)
     target = _pick_node(cfg, decision)
@@ -465,6 +816,13 @@ def cmd_ask(text: str, cfg: dict) -> int:
         result = {"error": "no enabled node in cluster", "routing": decision}
         print(json.dumps(result, indent=2))
         return 1
+
+    # === Master orchestration: split long tasks into subtasks =============
+    # If the ask is long/complex enough, decompose it into 2-4 subtasks,
+    # run them in parallel across the right slaves, then synthesize the
+    # final answer. Otherwise fall through to the single-ask path.
+    if should_decompose(text, cfg):
+        return cmd_ask_orchestrated(text, cfg, decision)
 
     result = ask_node(target, text)
     log_line = (
