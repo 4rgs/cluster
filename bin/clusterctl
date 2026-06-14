@@ -253,6 +253,7 @@ def check_node(node: dict) -> dict:
             "host": node.get("host"),
             "protocol": proto,
             "model": node.get("model", ""),
+            "role": node.get("role"),
             "ok": True,
             "latency_ms": latency_ms,
             "model_available": model_available,
@@ -269,6 +270,7 @@ def check_node(node: dict) -> dict:
             "host": node.get("host"),
             "protocol": proto,
             "model": node.get("model", ""),
+            "role": node.get("role"),
             "ok": False,
             "latency_ms": round((time.time() - t0) * 1000, 1),
             "model_available": False,
@@ -486,9 +488,28 @@ def ask_node_with_failover(node: dict, text: str, cfg: dict) -> dict:
 def cmd_health(cfg: dict) -> int:
     out = {"cluster": cfg.get("meta", {}).get("name", "?"), "slaves": {}}
     for n in cfg.get("node", []):
-        if n.get("enabled", True) is False:
-            continue
-        out["slaves"][n["name"]] = check_node(n)
+        is_enabled = n.get("enabled", True) is not False
+        if is_enabled:
+            out["slaves"][n["name"]] = check_node(n)
+        else:
+            # Include disabled nodes with enabled=false, ok=false
+            proto = n.get("protocol", "")
+            host = n.get("host", "")
+            port = n.get("port", "")
+            base_url = f"{proto}://{host}:{port}"
+            out["slaves"][n["name"]] = {
+                "name": n["name"],
+                "host": n.get("host", ""),
+                "protocol": n.get("protocol", ""),
+                "model": n.get("model", ""),
+                "role": n.get("role"),
+                "ok": False,
+                "latency_ms": None,
+                "model_available": False,
+                "enabled": False,
+                "error": "disabled",
+                "base_url": base_url,
+            }
 
     # Hindsight node (always reported, independent of node list)
     if HINDSIGHT_ENABLED:
@@ -500,6 +521,7 @@ def cmd_health(cfg: dict) -> int:
             "host": "remote",
             "protocol": "hindsight",
             "model": f"{nc} nodes" if nc else "(empty)",
+            "role": "hindsight",
             "ok": h.get("ok", False),
             "latency_ms": h.get("latency_ms"),
             "model_available": h.get("ok", False),
@@ -508,9 +530,23 @@ def cmd_health(cfg: dict) -> int:
             "base_url": os.environ.get("HINDSIGHT_BASE", "http://127.0.0.1:8765"),
             "memory_stats": stats,
         }
+    
+    # Always include master node
+    out["slaves"]["master"] = {
+        "name": "master",
+        "host": "localhost",
+        "protocol": "hermes",
+        "model": "minimax-m3",
+        "role": "master",
+        "ok": True,
+        "latency_ms": 0,
+        "model_available": True,
+        "enabled": True,
+        "error": None,
+        "base_url": "http://localhost:4321",
+    }
     print(json.dumps(out, indent=2))
     return 0
-
 
 def cmd_route(text: str, cfg: dict) -> int:
     print(json.dumps(route(text, cfg), indent=2))

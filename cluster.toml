@@ -1,52 +1,7 @@
 [meta]
 name = "local-models-cluster"
 created = "2026-06-12"
-constraint = "modelos livianos — no saturar hardware"
-
-# Routing rules: keyword scoring. Each match adds a point. The ask goes
-# to whichever role has the highest score (code / chat / general).
-# This section is required for clusterctl `route` and `ask` to make
-# decisions. If missing, every ask defaults to `general`.
-[routing]
-code_keywords = [
-  "python", "py", "javascript", "js", "typescript", "ts", "rust", "go", "java", "kotlin",
-  "swift", "ruby", "php", "html", "css", "sql", "bash", "shell", "sh", "zsh",
-  "code", "function", "función", "func", "method", "método", "class", "clase",
-  "variable", "const", "let", "def ", "fn ", "func ", "import ", "export ",
-  "compile", "compilar", "build", "test", "tests",
-  "refactor", "refactorizar", "fix", "arreglar", "bug",
-  "regex", "json", "yaml", "toml", "xml", "docker", "dockerfile",
-  "kubernetes", "k8s", "ansible", "terraform", "makefile", "cmake",
-  "iteración", "iteration", "loop", "bucle", "array", "lista",
-  "objeto", "object", "struct", "enum", "trait", "interface", "tipo", "type",
-  "algoritmo", "algorithm", "sort", "recursión", "recursion",
-  "agregá", "agrega", "añadí", "añade", "add", "implementa", "implement",
-  "escribí", "escribe", "write", "hazme", "create", "crea", "armá", "arma",
-  "cambiá", "cambia", "change", "update", "actualiza", "modify", "modificá",
-  "borrá", "borra", "delete", "remove", "eliminá", "elimina",
-  "parse", "parcé", "parsea", "encode", "decode", "hash",
-  "api", "endpoint", "route", "middleware", "handler", "controller",
-  "git", "commit", "branch", "merge", "rebase",
-  "npm", "pip", "cargo", "mvn", "gradle", "brew", "apt", "yum", "pacman",
-]
-chat_keywords = [
-  "explicá", "explica", "explain", "describe", "describí", "what is", "qué es",
-  "por qué", "why", "how does", "cómo", "para qué", "what's", "cuál es",
-  "decime", "dime", "tell me", "say", "di ", "tell ",
-  "feedback", "review", "revisá", "opinión", "opinion", "pensás", "pensar",
-  "plan", "planificá", "outline", "resumen", "summary",
-  "summarize", "resumí", "explicame", "explícame", "translate", "traducí", "traduce",
-  "diferencia", "difference", "compará", "compare", "versus",
-  "ventaja", "desventaja", "pro", "con", "pros", "cons",
-  "hola", "hi", "hello", "buenos", "buenas", "qué tal",
-  "thank", "gracias", "thanks", "thx", "bye", "chau",
-  "ayuda", "help", "asistirme", "assist",
-]
-general_penalty = [
-  "hola", "hi ", "hello", "buenos", "buenas", "qué tal", "como estas",
-  "cómo estás", "how are you", "thanks", "gracias", "ok", "okay", "vale",
-  "jaja", "lol", "jeje", "haha",
-]
+constraint = "modelos livianos \u2014 no saturar hardware"
 
 [[node]]
 name = "slave-a"
@@ -59,7 +14,8 @@ model = "gemma4:12b-mlx"
 fallback_model = "llama3:latest"
 timeout_s = 120
 enabled = true
-purpose = "razonamiento general, reflexión, resúmenes, explicaciones"
+purpose = "razonamiento general, reflexi\u00f3n, res\u00famenes, explicaciones"
+fallback_node = "slave-b"
 
 [[node]]
 name = "slave-b"
@@ -72,4 +28,4 @@ model = "qwen/qwen3.6-27b"
 fallback_model = "qwen/qwen3.6-27b"
 timeout_s = 180
 enabled = true
-purpose = "código, comandos bash, iteración multi-step, tool calling"
+purpose = "c\u00f3digo, comandos bash, iteraci\u00f3n multi-step, tool calling"

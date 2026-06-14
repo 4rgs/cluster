@@ -1,0 +1,8 @@
+{"kind": "ask", "node": "slave-a", "ok": true, "latency_s": 35.03, "text_len": 18, "ts": 1781380521017}
+{"kind": "ask", "node": "slave-a", "ok": true, "latency_s": 33.58, "text_len": 18, "ts": 1781380590762}
+{"kind": "ask", "node": "slave-a", "ok": true, "latency_s": 52.36, "text_len": 39, "ts": 1781380661822}
+{"kind": "ask_failover", "primary": "slave-b", "succeeded_on": "slave-a", "primary_error": "<urlopen error [Errno 113] No route to host>", "latency_s": 40.53, "total_s": 43.66, "ts": 1781380766465}
+{"kind": "ask", "node": "slave-a", "ok": true, "latency_s": 6.89, "text_len": 6, "ts": 1781381547857}
+{"kind": "ask", "node": "slave-a", "ok": true, "latency_s": 7.7, "text_len": 6, "ts": 1781381556013}
+{"kind": "ask", "node": "slave-a", "ok": true, "latency_s": 9.19, "text_len": 6, "ts": 1781381565612}
+{"kind": "tune_applied", "proposal_id": "add-fallback-to-slave-a", "target": "slave-a", "change": "set_fallback_node", "value": "slave-b", "confidence": 0.5, "ts": 1781416217879}
