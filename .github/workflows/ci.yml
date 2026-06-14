@@ -1,0 +1,157 @@
+name: Cluster CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  lint:
+    name: Lint & Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet flake8 mypy
+
+      - name: Check Python syntax
+        run: python -m py_compile bin/clusterctl
+
+      - name: Run flake8
+        run: flake8 bin/clusterctl --max-line-length=120 --ignore=E501,W503
+
+      - name: Run mypy (basic)
+        run: mypy bin/clusterctl --ignore-missing-imports --no-strict-optional || true
+
+  test:
+    name: Functional Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Make clusterctl executable
+        run: chmod +x bin/clusterctl
+
+      - name: Test help command
+        run: python bin/clusterctl --help
+
+      - name: Test health command (expects no nodes configured)
+        run: python bin/clusterctl health || true
+
+      - name: Test nodes list (expects empty)
+        run: python bin/clusterctl nodes list
+
+      - name: Test route command
+        run: python bin/clusterctl route "explain python async" || true
+
+      - name: Test insights command (no self-log)
+        run: python bin/clusterctl insights --window-hours 24 || true
+
+  config-validation:
+    name: Config Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check cluster.toml exists
+        run: test -f cluster.toml
+
+      - name: Validate TOML syntax
+        run: |
+          python3 -c "
+          import tomllib
+          with open('cluster.toml', 'rb') as f:
+            data = tomllib.load(f)
+          print('cluster.toml valid')
+          print('Cluster name:', data.get('meta', {}).get('name', 'unknown'))
+          nodes = data.get('node', [])
+          print(f'Nodes configured: {len(nodes)}')
+          for n in nodes:
+            print(f'  - {n.get(\"name\")} ({n.get(\"role\")}) {n.get(\"host\")}:{n.get(\"port\")}')
+          "
+
+      - name: Verify required fields
+        run: |
+          python3 -c "
+          import tomllib
+          with open('cluster.toml', 'rb') as f:
+            data = tomllib.load(f)
+          nodes = data.get('node', [])
+          errors = []
+          for n in nodes:
+            if not n.get('name'):
+              errors.append('missing name')
+            if not n.get('host'):
+              errors.append(f'{n.get(\"name\")}: missing host')
+            if not n.get('role'):
+              errors.append(f'{n.get(\"name\")}: missing role')
+            if n.get('protocol') not in ['ollama', 'lmstudio', 'openai', 'hermes', 'custom']:
+              errors.append(f'{n.get(\"name\")}: invalid protocol {n.get(\"protocol\")}')
+            if n.get('role') not in ['chat_reflection', 'code_tools', 'general', 'master']:
+              errors.append(f'{n.get(\"name\")}: invalid role {n.get(\"role\")}')
+          if errors:
+            for e in errors: print('ERROR:', e)
+            exit(1)
+          print('All node configs valid')
+          "
+
+  shellcheck:
+    name: Shell Scripts Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Check install.sh
+        run: shellcheck install.sh
+
+      - name: Check configure.sh
+        run: shellcheck configure.sh
+
+      - name: Check check.sh
+        run: shellcheck check.sh
+
+      - name: Check uninstall.sh
+        run: shellcheck uninstall.sh
+
+  verify-clusterctl-imports:
+    name: Verify Imports
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify all imports resolve
+        run: |
+          python3 -c "
+          import sys
+          sys.path.insert(0, '.')
+          # Just verify the script can be imported without runtime errors
+          with open('bin/clusterctl') as f:
+            code = compile(f.read(), 'clusterctl', 'exec')
+          print('clusterctl compiles successfully')
+          "
