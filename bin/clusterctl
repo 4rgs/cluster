@@ -392,6 +392,95 @@ def ask_node(node: dict, text: str) -> dict:
 
 
 # =====================
+# Self-healing: auto-failover + self-log
+# =====================
+SELF_LOG_PATH = os.environ.get("CLUSTER_SELF_LOG", "/home/spids/cluster/data/self-log.jsonl")
+
+def _log_self_event(event: dict) -> None:
+    """Append a self-monitoring event to the JSONL log. Best-effort."""
+    try:
+        os.makedirs(os.path.dirname(SELF_LOG_PATH), exist_ok=True)
+        with open(SELF_LOG_PATH, "a") as f:
+            f.write(json.dumps({**event, "ts": int(time.time() * 1000)}) + "\n")
+    except OSError:
+        pass
+
+
+def _candidate_fallback_nodes(node: dict, cfg: dict) -> list:
+    """Return enabled nodes that could serve as fallback for `node`.
+    Tries: (1) the node's own fallback_node if set, (2) any other
+    enabled node with the same role, (3) any enabled node."""
+    candidates = []
+    fb = node.get("fallback_node")
+    if fb:
+        for n in cfg.get("node", []):
+            if n.get("name") == fb and n.get("enabled", True):
+                candidates.append(n)
+                break
+    role = node.get("role")
+    for n in cfg.get("node", []):
+        if n.get("name") == node.get("name"):
+            continue
+        if not n.get("enabled", True):
+            continue
+        if n not in candidates and n.get("role") == role:
+            candidates.append(n)
+    for n in cfg.get("node", []):
+        if n.get("name") == node.get("name"):
+            continue
+        if not n.get("enabled", True):
+            continue
+        if n not in candidates:
+            candidates.append(n)
+    return candidates
+
+
+def ask_node_with_failover(node: dict, text: str, cfg: dict) -> dict:
+    """Call ask_node. If the node fails, automatically try fallback nodes.
+    Returns a dict augmented with 'attempts' (list of {node, ok, error, latency_s})."""
+    t0 = time.time()
+    primary = ask_node(node, text)
+    attempts = [{"node": node.get("name"), "ok": primary["ok"],
+                 "error": primary.get("error"), "latency_s": primary["latency_s"]}]
+    if primary["ok"]:
+        _log_self_event({
+            "kind": "ask",
+            "node": node.get("name"),
+            "ok": True,
+            "latency_s": primary["latency_s"],
+            "text_len": len(text),
+        })
+        return {**primary, "attempts": attempts, "failed_over": False}
+
+    # Try fallbacks
+    for fb_node in _candidate_fallback_nodes(node, cfg):
+        fb = ask_node(fb_node, text)
+        attempts.append({"node": fb_node.get("name"), "ok": fb["ok"],
+                         "error": fb.get("error"), "latency_s": fb["latency_s"]})
+        if fb["ok"]:
+            _log_self_event({
+                "kind": "ask_failover",
+                "primary": node.get("name"),
+                "succeeded_on": fb_node.get("name"),
+                "primary_error": primary.get("error"),
+                "latency_s": fb["latency_s"],
+                "total_s": round(time.time() - t0, 2),
+            })
+            return {**fb, "attempts": attempts, "failed_over": True,
+                    "primary_node": node.get("name")}
+
+    # All failed
+    _log_self_event({
+        "kind": "ask_failed",
+        "node": node.get("name"),
+        "attempts": attempts,
+        "text_len": len(text),
+    })
+    return {**primary, "attempts": attempts, "failed_over": False,
+            "all_failed": True}
+
+
+# =====================
 # CLI subcommands
 # =====================
 def cmd_health(cfg: dict) -> int:
@@ -824,10 +913,19 @@ def cmd_ask(text: str, cfg: dict) -> int:
     if should_decompose(text, cfg):
         return cmd_ask_orchestrated(text, cfg, decision)
 
-    result = ask_node(target, text)
+    result = ask_node_with_failover(target, text, cfg)
+    # Pick the actual node that served the request (may differ from target if failover)
+    served_node_name = result.get("node") or target["name"]
+    if served_node_name != target["name"]:
+        # Find the served node's config for logging
+        served_node = next((n for n in cfg.get("node", []) if n.get("name") == served_node_name), target)
+    else:
+        served_node = target
     log_line = (
-        f"slave={target['name']} model={target.get('model', '?')} "
-        f"latency={result['latency_s']}s routing={decision} "
+        f"slave={served_node_name} (target={target['name']}) "
+        f"model={served_node.get('model', '?')} "
+        f"latency={result['latency_s']}s failed_over={result.get('failed_over', False)} "
+        f"all_failed={result.get('all_failed', False)} routing={decision} "
         f"task={text[:120]!r} preview={result.get('content','')[:200]!r}"
     )
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -836,13 +934,16 @@ def cmd_ask(text: str, cfg: dict) -> int:
         f.write(f"{datetime.now().isoformat()} | {log_line}\n")
     out = {
         "routing": decision,
-        "node": target["name"],
-        "host": target.get("host"),
-        "model": target.get("model"),
+        "node": served_node_name,
+        "target_node": target["name"],
+        "host": served_node.get("host"),
+        "model": served_node.get("model"),
         "content": result.get("content", ""),
         "latency_s": result.get("latency_s"),
         "ok": result.get("ok"),
         "error": result.get("error"),
+        "failed_over": result.get("failed_over", False),
+        "attempts": result.get("attempts", []),
     }
     print(json.dumps(out, indent=2))
 
@@ -944,6 +1045,464 @@ def cmd_nodes_enable(name: str, enabled: bool, cfg: dict) -> int:
 
 
 # =====================
+# Self-tuning: analyze self-log and propose config changes
+# =====================
+def _load_self_events(window_hours: int = 24) -> list:
+    """Load self-log events from the last `window_hours` hours."""
+    if not os.path.exists(SELF_LOG_PATH):
+        return []
+    cutoff = int((time.time() - window_hours * 3600) * 1000)
+    events = []
+    try:
+        with open(SELF_LOG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                    if ev.get("ts", 0) >= cutoff:
+                        events.append(ev)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return events
+
+
+def _confidence_from_samples(n: int, divisor: int = 20) -> float:
+    """Map sample count to a 0..1 confidence score.
+    0 samples -> 0.0, 1 sample -> 0.1, divisor samples -> ~0.86, 2*divisor -> ~0.98."""
+    if n <= 0:
+        return 0.0
+    return round(1.0 - 0.5 ** (n / divisor), 3)
+
+
+def _build_proposals(events: list, cfg: dict) -> list:
+    """Generate a list of tuning proposals based on self-log evidence."""
+    proposals = []
+
+    # === 0) Repeated failover from a primary ===============================
+    # If a node fails N+ times in a row (all routed to fallbacks), suggest
+    # either disabling it (high risk) or setting a healthier primary.
+    failovers_by_primary = {}
+    for e in events:
+        if e.get("kind") == "ask_failover":
+            p = e.get("primary")
+            if p:
+                failovers_by_primary[p] = failovers_by_primary.get(p, 0) + 1
+    for prim, count in failovers_by_primary.items():
+        if count >= 3:
+            conf = _confidence_from_samples(count, divisor=10)
+            prim_node = next((n for n in cfg.get("node", []) if n.get("name") == prim), None)
+            if not prim_node:
+                continue
+            # Suggest setting the most-recently-successful fallback as the
+            # recommended replacement or just disabling
+            recent_succs = [e.get("succeeded_on") for e in events
+                            if e.get("kind") == "ask_failover" and e.get("primary") == prim]
+            succ_count = {}
+            for s in recent_succs:
+                if s:
+                    succ_count[s] = succ_count.get(s, 0) + 1
+            top_succ = max(succ_count.items(), key=lambda x: x[1])[0] if succ_count else None
+            desc = (
+                f"`{prim}` failed {count} times in the last 24h. "
+                + (f"Most asks succeeded on `{top_succ}`. " if top_succ else "")
+                + "Consider disabling this node or replacing it."
+            )
+            proposals.append({
+                "id": f"primary-failing-{prim}",
+                "kind": "set_node_enabled",
+                "target_node": prim,
+                "value": False,
+                "evidence": {
+                    "failover_count": count,
+                    "fallback_succeeded": succ_count,
+                },
+                "description": desc,
+                "confidence": conf,
+                "risk": "high",
+                "auto_apply": False,
+            })
+
+    # === 1) Per-node latency comparison (rebalancing suggestion) ===========
+    # Group events by node. For ask events, attribute to e["node"] (the
+    # actual server). For ask_failover events, attribute to the primary
+    # (which had the high latency / error), not the failover target.
+    by_node_primary = {}  # for slow-node analysis (which node is slow)
+    by_node_actual = {}   # for fast-node analysis (which node IS the workhorse)
+    for e in events:
+        kind = e.get("kind")
+        n = e.get("node")
+        if kind == "ask" and n:
+            by_node_primary.setdefault(n, []).append(e)
+            by_node_actual.setdefault(n, []).append(e)
+        elif kind == "ask_failover":
+            primary = e.get("primary")
+            succ = e.get("succeeded_on")
+            if primary:
+                # The primary was slow/failed; if it had a partial latency, count it
+                by_node_primary.setdefault(primary, []).append(e)
+            if succ:
+                by_node_actual.setdefault(succ, []).append(e)
+
+    # Need at least 2 nodes with data to compare
+    if len(by_node_actual) >= 2:
+        node_stats = []
+        for n, evs in by_node_actual.items():
+            lats = [e.get("latency_s", 0) for e in evs if e.get("ok") is not False and e.get("latency_s")]
+            # For failover events, latency is the failover node's latency (so the
+            # 'actual' for that node is fast). For primary, latency is the slow one.
+            if lats:
+                node_stats.append({"node": n, "avg": sum(lats) / len(lats), "samples": len(lats)})
+        if len(node_stats) >= 2:
+            node_stats.sort(key=lambda x: x["avg"])
+            fastest = node_stats[0]
+            slowest = node_stats[-1]
+            if slowest["avg"] > fastest["avg"] * 1.5:
+                slowest_node = next((n for n in cfg.get("node", []) if n.get("name") == slowest["node"]), None)
+                if slowest_node:
+                    current_fb = slowest_node.get("fallback_node", "")
+                    if current_fb != fastest["node"]:
+                        conf = _confidence_from_samples(min(fastest["samples"], slowest["samples"]))
+                        proposals.append({
+                            "id": f"rebalance-{slowest['node']}-to-{fastest['node']}",
+                            "kind": "set_fallback_node",
+                            "target_node": slowest["node"],
+                            "value": fastest["node"],
+                            "evidence": {
+                                "slowest": slowest,
+                                "fastest": fastest,
+                                "ratio": round(slowest["avg"] / fastest["avg"], 2),
+                            },
+                            "description": (
+                                f"Set `{fastest['node']}` as fallback for `{slowest['node']}`. "
+                                f"`{slowest['node']}` averages {slowest['avg']:.2f}s vs "
+                                f"`{fastest['node']}` at {fastest['avg']:.2f}s "
+                                f"({slowest['avg'] / fastest['avg']:.1f}x slower) "
+                                f"over {min(fastest['samples'], slowest['samples'])} samples."
+                            ),
+                            "confidence": conf,
+                            "risk": "low",
+                            "auto_apply": conf >= 0.8 and slowest["samples"] >= 30,
+                        })
+
+    # === 2) High failure rate per node =====================================
+    for n in cfg.get("node", []):
+        name = n.get("name")
+        node_events = [e for e in events if e.get("node") == name and e.get("kind") == "ask"]
+        fails = [e for e in node_events if not e.get("ok")]
+        if not node_events:
+            continue
+        rate = len(fails) / len(node_events)
+        if rate > 0.2 and len(node_events) >= 5:
+            conf = _confidence_from_samples(len(node_events), divisor=15)
+            proposals.append({
+                "id": f"disable-{name}",
+                "kind": "set_node_enabled",
+                "target_node": name,
+                "value": False,
+                "evidence": {
+                    "failure_rate": round(rate, 3),
+                    "failures": len(fails),
+                    "total": len(node_events),
+                    "sample_errors": [e.get("error", "")[:80] for e in fails[:3]],
+                },
+                "description": (
+                    f"Disable `{name}` — it has {rate * 100:.0f}% failure rate "
+                    f"({len(fails)}/{len(node_events)} fails). "
+                    f"Sample errors: {fails[0].get('error', '')[:80] if fails else 'n/a'}"
+                ),
+                "confidence": conf,
+                "risk": "high",
+                "auto_apply": False,  # never auto-disable without human review
+            })
+
+    # === 3) Overloaded node: high failover count suggests adding capacity ==
+    failovers_to = {}
+    for e in events:
+        if e.get("kind") == "ask_failover":
+            succ = e.get("succeeded_on")
+            if succ:
+                failovers_to[succ] = failovers_to.get(succ, 0) + 1
+    for succ_name, count in failovers_to.items():
+        if count >= 5:
+            conf = _confidence_from_samples(count, divisor=10)
+            succ_node = next((n for n in cfg.get("node", []) if n.get("name") == succ_name), None)
+            if succ_node:
+                proposals.append({
+                    "id": f"overload-{succ_name}",
+                    "kind": "investigate_capacity",
+                    "target_node": succ_name,
+                    "value": None,
+                    "evidence": {
+                        "failover_count": count,
+                        "failovers_received": count,
+                    },
+                    "description": (
+                        f"`{succ_name}` is handling {count} failover requests in the last 24h. "
+                        f"Consider adding another node with the same role to distribute load."
+                    ),
+                    "confidence": conf,
+                    "risk": "low",
+                    "auto_apply": False,  # suggestions only
+                })
+
+    # === 4) Upgrades: proactive improvements based on observed patterns =====
+    # These are SUGGESTIONS only (not auto-apply) — the LLM master
+    # reviews and decides. They push the cluster to be BETTER, not just
+    # patch over issues.
+    upgrades = []
+
+    # Pre-compute node_latencies for all upgrade checks
+    node_latencies = []
+    if len(by_node_actual) >= 2:
+      for n, evs in by_node_actual.items():
+        lats = [e.get("latency_s", 0) for e in evs if e.get("ok") is not False and e.get("latency_s")]
+        if lats:
+          node_latencies.append((n, sum(lats) / len(lats), len(lats)))
+      if len(node_latencies) >= 2:
+        node_latencies.sort(key=lambda x: x[1])
+        slowest = node_latencies[-1]
+        # Already has fallback proposal for this; suggest one if absent
+        slowest_node = next((n for n in cfg.get("node", []) if n.get("name") == slowest[0]), None)
+        if slowest_node and not slowest_node.get("fallback_node") and slowest[2] >= 5:
+          conf = _confidence_from_samples(slowest[2], divisor=15)
+          upgrades.append({
+            "id": f"add-fallback-to-{slowest[0]}",
+            "kind": "set_fallback_node",
+            "target_node": slowest[0],
+            "value": node_latencies[0][0],  # fastest
+            "evidence": {
+                "slowest": {"node": slowest[0], "avg": slowest[1], "samples": slowest[2]},
+                "fastest": node_latencies[0][0],
+            },
+            "description": f"Upgrade: `{slowest[0]}` averages {slowest[1]:.1f}s but has no fallback. Add `{node_latencies[0][0]}` as a fallback for resilience.",
+            "confidence": conf,
+            "risk": "low",
+            "auto_apply": False,  # Suggestions only — master reviews
+          })
+
+    # (b) Old / outdated fallback_node pointing to a slower node
+    # If node X's fallback_node is slower than another enabled node, suggest
+    # upgrading the fallback to the faster node.
+    for n in cfg.get("node", []):
+      if not n.get("enabled", True): continue
+      current_fb = n.get("fallback_node")
+      if not current_fb: continue
+      # Find current avg latency
+      this_lat = next((avg for nm, avg, _ in node_latencies if nm == n["name"]), None)
+      fb_lat = next((avg for nm, avg, _ in node_latencies if nm == current_fb), None)
+      if this_lat and fb_lat and fb_lat > this_lat * 1.5:
+        # Find a faster node
+        faster = next((nm for nm, avg, _ in node_latencies
+                      if nm != n["name"] and avg < this_lat and nm != current_fb), None)
+        if faster and faster != current_fb:
+          upgrades.append({
+            "id": f"upgrade-fallback-of-{n['name']}",
+            "kind": "set_fallback_node",
+            "target_node": n["name"],
+            "value": faster,
+            "evidence": {
+                "current_fallback": current_fb,
+                "current_fb_avg": fb_lat,
+                "this_node_avg": this_lat,
+                "proposed_fallback": faster,
+            },
+            "description": f"Upgrade: `{n['name']}`'s fallback (`{current_fb}`) averages {fb_lat:.1f}s, slower than the primary ({this_lat:.1f}s). Better fallback: `{faster}`.",
+            "confidence": _confidence_from_samples(slowest[2] if len(node_latencies) > 1 else 5, divisor=20),
+            "risk": "low",
+            "auto_apply": False,
+          })
+
+    # (c) No fallback at all (resilience upgrade)
+    for n in cfg.get("node", []):
+      if not n.get("enabled", True): continue
+      if n.get("fallback_node"): continue
+      # Find a healthy node of any role
+      healthy = next((m for m in cfg.get("node", [])
+                     if m.get("name") != n.get("name") and m.get("enabled", True)), None)
+      if healthy:
+        # We don't suggest a specific one — let the master decide
+        upgrades.append({
+          "id": f"add-fallback-to-{n['name']}",
+          "kind": "set_fallback_node",
+          "target_node": n["name"],
+          "value": healthy["name"],
+          "evidence": {"reason": "no fallback configured"},
+          "description": f"Upgrade: `{n['name']}` has no fallback_node. Resilience: set fallback to `{healthy['name']}` so asks can be retried if `{n['name']}` fails.",
+          "confidence": 0.5,
+          "risk": "low",
+          "auto_apply": False,
+        })
+
+    # (d) Single-node hot spot → propose adding another node of the same role
+    for n in cfg.get("node", []):
+      if not n.get("enabled", True): continue
+      role = n.get("role")
+      # Count asks handled by this role
+      role_asks = sum(1 for evs in by_node_actual.values() for e in evs)
+      this_node_asks = sum(len(evs) for nm, evs in by_node_actual.items() if nm == n["name"])
+      # If this node handles >80% of role traffic, suggest adding another
+      if this_node_asks >= 10 and role_asks > 0 and this_node_asks / role_asks > 0.8:
+        upgrades.append({
+          "id": f"hot-spot-{n['name']}-role-{role}",
+          "kind": "investigate_capacity",
+          "target_node": n["name"],
+          "value": None,
+          "evidence": {
+            "this_node_asks": this_node_asks,
+            "role_total_asks": role_asks,
+            "concentration_pct": round(this_node_asks / role_asks * 100, 1),
+          },
+          "description": f"Upgrade: `{n['name']}` handles {this_node_asks / role_asks * 100:.0f}% of role={role} traffic. Consider adding another node of the same role for capacity.",
+          "confidence": 0.5,
+          "risk": "low",
+          "auto_apply": False,
+        })
+
+    # (e) Tighter interval if asks are spiking (or looser if quiet)
+    asks_last_24h = sum(1 for evs in by_node_actual.values() for e in evs)
+    if asks_last_24h > 200:
+      upgrades.append({
+        "id": "consider-lower-interval",
+        "kind": "set_interval",
+        "target_node": "master",
+        "value": 3,  # down from 5min
+        "evidence": {"asks_last_24h": asks_last_24h},
+        "description": f"Upgrade: high ask volume ({asks_last_24h}/24h). Consider tightening auto-tune interval from 5min to 3min to catch issues faster.",
+        "confidence": 0.4,
+        "risk": "low",
+        "auto_apply": False,
+      })
+    elif asks_last_24h < 5 and len(events) > 20:
+      upgrades.append({
+        "id": "consider-higher-interval",
+        "kind": "set_interval",
+        "target_node": "master",
+        "value": 10,  # up from 5min
+        "evidence": {"asks_last_24h": asks_last_24h},
+        "description": f"Upgrade: low ask volume ({asks_last_24h}/24h) but many self-log events. Consider loosening interval from 5min to 10min to reduce overhead.",
+        "confidence": 0.4,
+        "risk": "low",
+        "auto_apply": False,
+      })
+
+    # (f) Heuristic: model swap to a faster/newer one
+    # We don't know what models are available on each slave — that's a
+    # decision for the master. So we just suggest "consider rotating the
+    # model" if the current one is consistently slow.
+    for n in cfg.get("node", []):
+      if not n.get("enabled", True): continue
+      this_lat = next((avg for nm, avg, _ in node_latencies if nm == n["name"]), None)
+      this_samples = next((s for nm, _, s in node_latencies if nm == n["name"]), 0)
+      if this_lat and this_samples >= 5 and this_lat > 15:
+        upgrades.append({
+          "id": f"consider-rotating-model-on-{n['name']}",
+          "kind": "investigate_capacity",
+          "target_node": n["name"],
+          "value": None,
+          "evidence": {"avg_latency_s": this_lat, "samples": this_samples, "current_model": n.get("model", "?")},
+          "description": f"Upgrade: `{n['name']}` averages {this_lat:.1f}s per ask with model `{n.get('model', '?')}`. Consider rotating to a faster model (master review needed for the new model name).",
+          "confidence": 0.5,
+          "risk": "low",
+          "auto_apply": False,
+        })
+
+    # Replace the existing per-node latency suggestion with the
+    # richer upgrades array. We append upgrades to the regular proposals.
+    # (We do NOT replace the originals because they are reactive fixes.)
+    return proposals + upgrades
+
+
+def _apply_proposal(proposal: dict, cfg: dict) -> tuple:
+    """Apply a single proposal to cfg in memory. Returns (ok, message)."""
+    kind = proposal.get("kind")
+    if kind == "set_fallback_node":
+        for n in cfg.get("node", []):
+            if n.get("name") == proposal.get("target_node"):
+                n["fallback_node"] = proposal.get("value", "")
+                return True, f"set fallback_node={proposal['value']!r} on {n['name']!r}"
+        return False, f"node {proposal.get('target_node')!r} not found"
+    elif kind == "set_node_enabled":
+        for n in cfg.get("node", []):
+            if n.get("name") == proposal.get("target_node"):
+                n["enabled"] = bool(proposal.get("value"))
+                return True, f"set enabled={n['enabled']} on {n['name']!r}"
+        return False, f"node {proposal.get('target_node')!r} not found"
+    else:
+        return False, f"unsupported proposal kind: {kind!r}"
+
+
+def cmd_insights(cfg: dict, window_hours: int = 24, auto_apply: bool = False) -> int:
+    """Analyze the self-log and print tuning proposals as JSON.
+    With auto_apply=True, high-confidence low-risk proposals are applied
+    to cluster.toml in-place and the changes are recorded in the self-log."""
+    events = _load_self_events(window_hours)
+    proposals = _build_proposals(events, cfg)
+
+    applied = []
+    skipped = []
+    if auto_apply:
+        for p in proposals:
+            if p.get("auto_apply"):
+                ok, msg = _apply_proposal(p, cfg)
+                if ok:
+                    save_config(cfg)
+                    _log_self_event({
+                        "kind": "tune_applied",
+                        "proposal_id": p["id"],
+                        "target": p.get("target_node"),
+                        "change": p.get("kind"),
+                        "value": p.get("value"),
+                        "confidence": p.get("confidence"),
+                    })
+                    applied.append({"id": p["id"], "message": msg})
+                else:
+                    skipped.append({"id": p["id"], "message": msg})
+        # Re-build proposals list to show updated state
+        if applied:
+            proposals = _build_proposals(_load_self_events(window_hours), cfg)
+
+    out = {
+        "ok": True,
+        "window_hours": window_hours,
+        "events_analyzed": len(events),
+        "proposals": proposals,
+        "applied": applied,
+        "skipped": skipped,
+    }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_tune_apply(proposal_id: str, cfg: dict) -> int:
+    """Apply a single proposal by id."""
+    events = _load_self_events(24)
+    proposals = _build_proposals(events, cfg)
+    target = next((p for p in proposals if p.get("id") == proposal_id), None)
+    if not target:
+        print(json.dumps({"ok": False, "error": f"proposal {proposal_id!r} not found"}))
+        return 1
+    ok, msg = _apply_proposal(target, cfg)
+    if ok:
+        save_config(cfg)
+        _log_self_event({
+            "kind": "tune_applied",
+            "proposal_id": proposal_id,
+            "target": target.get("target_node"),
+            "change": target.get("kind"),
+            "value": target.get("value"),
+            "confidence": target.get("confidence"),
+        })
+        print(json.dumps({"ok": True, "applied": target, "message": msg}, indent=2))
+        return 0
+    print(json.dumps({"ok": False, "error": msg}))
+    return 1
+
+
+# =====================
 # Main
 # =====================
 def main() -> int:
@@ -955,6 +1514,16 @@ def main() -> int:
     pr.add_argument("text")
     pa = sub.add_parser("ask", help="route + send to a node")
     pa.add_argument("text")
+
+    # insights (self-tuning)
+    pi = sub.add_parser("insights", help="analyze self-log and propose tuning changes")
+    pi.add_argument("--window-hours", type=int, default=24)
+    pi.add_argument("--auto-apply", action="store_true",
+                   help="apply high-confidence low-risk proposals without asking")
+
+    # tune (apply a specific proposal)
+    pt = sub.add_parser("tune", help="apply a specific tuning proposal")
+    pt.add_argument("proposal_id")
 
     # nodes subcommands
     pn = sub.add_parser("nodes", help="manage cluster nodes")
@@ -989,6 +1558,10 @@ def main() -> int:
         return cmd_route(args.text, cfg)
     elif args.cmd == "ask":
         return cmd_ask(args.text, cfg)
+    elif args.cmd == "insights":
+        return cmd_insights(cfg, args.window_hours, args.auto_apply)
+    elif args.cmd == "tune":
+        return cmd_tune_apply(args.proposal_id, cfg)
     elif args.cmd == "nodes":
         if args.nodes_cmd == "list":
             return cmd_nodes_list(cfg)
